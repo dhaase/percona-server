@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, 2015, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2014, 2017, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or
    modify it under the terms of the GNU General Public License as
@@ -115,18 +115,14 @@ bool System_table_access::close_table(THD *thd, TABLE* table,
     if (need_commit)
     {
       if (error)
-      {
-        if (ha_rollback_trans(thd, true))
-          res= true;
-      }
+        res= ha_rollback_trans(thd, true);
       else
       {
         /*
           To make the commit not to block with global read lock set
           "ignore_global_read_lock" flag to true.
          */
-        if (ha_commit_trans(thd, true, true))
-          res= true;
+        res= ha_commit_trans(thd, true, true);
       }
     }
     /*
@@ -140,6 +136,7 @@ bool System_table_access::close_table(THD *thd, TABLE* table,
     thd->restore_backup_open_tables_state(backup);
   }
 
+  DBUG_EXECUTE_IF("simulate_flush_commit_error", {res= true;});
   DBUG_RETURN(res);
 }
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2003, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2003, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -88,6 +88,10 @@ my_bool	net_flush(NET *net);
 #define SOCKET_ERROR -1
 #endif
 
+#ifdef HAVE_OPENSSL
+#include <openssl/x509v3.h>
+#endif
+
 #include "client_settings.h"
 #include <sql_common.h>
 #include <mysql/client_plugin.h>
@@ -104,6 +108,8 @@ my_bool	net_flush(NET *net);
 }
 
 #define native_password_plugin_name "mysql_native_password"
+#define caching_sha2_password_plugin_name "caching_sha2_password"
+
 
 PSI_memory_key key_memory_mysql_options;
 PSI_memory_key key_memory_MYSQL_DATA;
@@ -717,6 +723,7 @@ void read_ok_ex(MYSQL *mysql, ulong length)
 {
   size_t total_len, len;
   uchar *pos, *saved_pos;
+  my_ulonglong affected_rows, insert_id;
   char *db;
 
   struct charset_info_st *saved_cs;
@@ -730,15 +737,29 @@ void read_ok_ex(MYSQL *mysql, ulong length)
 
   pos= mysql->net.read_pos + 1;
 
-  /* affected rows */
-  mysql->affected_rows= net_field_length_ll(&pos);
-  /* insert id */
-  mysql->insert_id= net_field_length_ll(&pos);
+  affected_rows = net_field_length_ll(&pos); /* affected rows */
+  insert_id = net_field_length_ll(&pos); /* insert id */
 
-  DBUG_PRINT("info",("affected_rows: %lu  insert_id: %lu",
-                     (ulong) mysql->affected_rows,
-                     (ulong) mysql->insert_id));
+  /*
+   The following check ensures that we skip the assignment for the
+   above read fields (i.e. affected_rows and insert_id) wherein the
+   EOF packets are deprecated and the server sends OK packet instead
+   with a packet header of 0xFE (254) to identify it as an EOF packet.
+   We ignore this assignment as the valid contents of EOF packet include
+   packet marker, server status and warning count only. However, we would
+   assign these values to the connection handle if it was an OK packet
+   with a packet header of 0x00.
+  */
+  if (!((mysql->server_capabilities & CLIENT_DEPRECATE_EOF) &&
+        mysql->net.read_pos[0] == 254))
+  {
+    mysql->affected_rows= affected_rows;
+    mysql->insert_id= insert_id;
 
+    DBUG_PRINT("info",("affected_rows: %lu  insert_id: %lu",
+                       (ulong) mysql->affected_rows,
+                       (ulong) mysql->insert_id));
+  }
   /* server status */
   mysql->server_status= uint2korr(pos);
   pos += 2;
@@ -1326,7 +1347,7 @@ cli_advanced_command(MYSQL *mysql, enum enum_server_command command,
       Return to READY_FOR_COMMAND protocol stage in case server reports error 
       or sends OK packet.
     */
-    if (!result || mysql->net.read_pos[0] == 0x00)
+    if (result || mysql->net.read_pos[0] == 0x00)
       MYSQL_TRACE_STAGE(mysql, READY_FOR_COMMAND);
 #endif
   }
@@ -1717,16 +1738,6 @@ static int add_init_command(struct st_mysql_options *options, const char *cmd)
 
 
 #if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
-#define SET_SSL_OPTION(opt_var, arg, mode) \
-  do { \
-    SET_OPTION(opt_var, arg); \
-    if (mysql->options.opt_var) \
-    { \
-      ENSURE_EXTENSIONS_PRESENT(&mysql->options); \
-      mysql->options.extension->ssl_mode= mode; \
-    } \
-  } while (0)
-
 #define EXTENSION_SET_SSL_STRING(OPTS, X, STR, mode) \
   do { \
     EXTENSION_SET_STRING(OPTS, X, STR); \
@@ -1734,18 +1745,14 @@ static int add_init_command(struct st_mysql_options *options, const char *cmd)
       (OPTS)->extension->ssl_mode= mode; \
   } while (0)
 #else
-#define SET_SSL_OPTION(opt_var, arg, mode) \
-    do { \
-      ; \
-    } while(0)
 #define EXTENSION_SET_SSL_STRING(OPTS, X, STR, mode) \
     do { \
       ; \
     } while(0)
 #endif
 
-static char *set_ssl_option_unpack_path(struct st_mysql_options *options,
-                                        const char *arg, unsigned int mode)
+#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
+static char *set_ssl_option_unpack_path(const char *arg)
 {
   char *opt_var= NULL;
   if (arg)
@@ -1754,12 +1761,11 @@ static char *set_ssl_option_unpack_path(struct st_mysql_options *options,
                                   MYF(MY_WME));
     unpack_filename(buff, (char *)arg);
     opt_var= my_strdup(key_memory_mysql_options, buff, MYF(MY_WME));
-    ENSURE_EXTENSIONS_PRESENT(options);
-    options->extension->ssl_mode= mode;
     my_free(buff);
   }
   return opt_var;
 }
+#endif
 
 
 void mysql_read_default_options(struct st_mysql_options *options,
@@ -1825,6 +1831,7 @@ void mysql_read_default_options(struct st_mysql_options *options,
 	  break;
         case OPT_pipe:
           options->protocol = MYSQL_PROTOCOL_PIPE;
+          break;
 	case OPT_connect_timeout:
 	case OPT_timeout:
 	  if (opt_arg)
@@ -2175,7 +2182,7 @@ unpack_fields(MYSQL *mysql, MYSQL_ROWS *data,MEM_ROOT *alloc,uint fields,
   for (row=data; row ; row = row->next,field++)
   {
     /* fields count may be wrong */
-    DBUG_ASSERT((uint) (field - result) < fields);
+    if (field < result || (uint) (field - result) >= fields) DBUG_RETURN(NULL);
     if (unpack_field(mysql, alloc, default_value, server_capabilities,
                      row, field))
     {
@@ -2287,6 +2294,7 @@ MYSQL_DATA *cli_read_rows(MYSQL *mysql,MYSQL_FIELD *mysql_fields,
 
   if ((pkt_len= cli_safe_read(mysql, &is_data_packet)) == packet_error)
     DBUG_RETURN(0);
+  if (pkt_len == 0) DBUG_RETURN(0);
   if (!(result=(MYSQL_DATA*) my_malloc(key_memory_MYSQL_DATA,
                                        sizeof(MYSQL_DATA),
 				       MYF(MY_WME | MY_ZEROFILL))))
@@ -2424,18 +2432,20 @@ read_one_row(MYSQL *mysql,uint fields,MYSQL_ROW row, ulong *lengths)
   end_pos=pos+pkt_len;
   for (field=0 ; field < fields ; field++)
   {
-    if ((len=(ulong) net_field_length(&pos)) == NULL_LENGTH)
+    len=(ulong) net_field_length_checked(&pos, (ulong)(end_pos - pos));
+    if (pos > end_pos)
+    {
+      set_mysql_error(mysql, CR_UNKNOWN_ERROR, unknown_sqlstate);
+      return -1;
+    }
+
+    if (len == NULL_LENGTH)
     {						/* null field */
       row[field] = 0;
       *lengths++=0;
     }
     else
     {
-      if (len > (ulong) (end_pos - pos))
-      {
-        set_mysql_error(mysql, CR_UNKNOWN_ERROR, unknown_sqlstate);
-        return -1;
-      }
       row[field] = (char*) pos;
       pos+=len;
       *lengths++=len;
@@ -2648,6 +2658,198 @@ mysql_get_ssl_cipher(MYSQL *mysql MY_ATTRIBUTE((unused)))
 }
 
 
+#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
+
+#include <openssl/x509v3.h>
+
+#if defined(HAVE_X509_CHECK_HOST) && defined(HAVE_X509_CHECK_IP)
+  #define HAVE_X509_CHECK_FUNCTIONS 1
+#endif
+
+#if !defined(HAVE_X509_CHECK_FUNCTIONS) && !defined(HAVE_YASSL)
+
+/*
+  Compares the DNS entry from the Subject Alternative Names (SAN) list with
+  the provided host name
+
+  SYNOPSIS
+  ssl_cmp_san_dns_name()
+    dns_name           pointer to a SAN list DNS entry
+    host_name          name of the server
+    errptr             if we fail, we'll return (a pointer to a string
+                       describing) the reason here
+
+  RETURN VALUES
+   0 Success
+   1 Failed to validate server
+
+*/
+
+static int ssl_cmp_san_dns_name(ASN1_STRING *dns_name, const char* host_name,
+                                const char **errptr)
+{
+  const char *cn;
+  DBUG_ENTER("ssl_cmp_san_dns_name");
+  *errptr= NULL;
+  if (dns_name == NULL)
+  {
+    *errptr= "Failed to get DNS name from SAN list item";
+    DBUG_RETURN(1);
+  }
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+  cn= (const char *)ASN1_STRING_data(dns_name);
+#else
+  cn= (const char *)ASN1_STRING_get0_data(dns_name);
+#endif
+  if (cn == NULL)
+  {
+    *errptr= "Failed to get data from SAN DNS name";
+    DBUG_RETURN(1);
+  }
+  // There should not be any NULL embedded in the DNS name
+  if ((size_t)ASN1_STRING_length(dns_name) != strlen(cn))
+  {
+    *errptr= "NULL embedded in the certificate SAN DNS name";
+    DBUG_RETURN(1);
+  }
+  DBUG_PRINT("info", ("SAN DNS name in cert: %s", cn));
+  if (!strcmp(cn, host_name))
+    DBUG_RETURN(0);
+
+  DBUG_RETURN(1);
+}
+
+/*
+  Compares the IP address entry from the Subject Alternative Names (SAN) list
+  with the provided host IP address
+
+  SYNOPSIS
+  ssl_cmp_san_ip_address()
+    ip_address         pointer to a SAN list IP address entry
+    host_ip            IP address of the server
+    host_ip_len        server IP address length (must be either 4 or 16)
+    errptr             if we fail, we'll return (a pointer to a string
+                       describing) the reason here
+
+  RETURN VALUES
+   0 Success
+   1 Failed to validate server
+
+*/
+
+static int ssl_cmp_san_ip_address(ASN1_OCTET_STRING *ip_address,
+                                  const unsigned char* host_ip,
+                                  size_t host_ip_len,
+                                  const char **errptr)
+{
+  const unsigned char* ip;
+  size_t ip_address_len;
+  DBUG_ENTER("ssl_cmp_san_ip_address");
+  *errptr= NULL;
+  if (ip_address == NULL)
+  {
+    *errptr= "Failed to get IP address from SAN list item";
+    DBUG_RETURN(1);
+  }
+  ip_address_len= ASN1_STRING_length(ip_address);
+  /* IP address length must be either 4 (IPV4) or 16 (IPV6) */
+  if (ip_address_len != 4 && ip_address_len != 16)
+  {
+    *errptr= "Invalid IP address embedded in the certificate SAN IP address";
+    DBUG_RETURN(1);
+  }
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+  ip= ASN1_STRING_data(ip_address);
+#else
+  ip= ASN1_STRING_get0_data(ip_address);
+#endif
+  if (ip == NULL)
+  {
+    *errptr= "Failed to get data from SAN IP address";
+    DBUG_RETURN(1);
+  }
+  if (ip_address_len == host_ip_len &&
+      memcmp(host_ip, ip, host_ip_len) == 0)
+    DBUG_RETURN(0);
+
+  DBUG_RETURN(1);
+}
+
+/*
+  Check the certificate's Subject Alternative Names (SAN) against the
+  hostname / IP address we connected to
+
+  SYNOPSIS
+  ssl_verify_server_cert_san()
+    server_cert        pointer to a X509 certificate
+    hostname_or_ip     name of the server / pointer to a V4/V6 IP address
+                       buffer
+    hostname_or_ip_len 0 for host name, 4/16 for ip address
+    errptr             if we fail, we'll return (a pointer to a string
+                       describing) the reason here
+
+  RETURN VALUES
+   0 Success
+   1 Failed to validate server
+
+*/
+
+static int ssl_verify_server_cert_san(X509 *server_cert,
+                                      const char* hostname_or_ip,
+                                      size_t hostname_or_ip_len,
+                                      const char **errptr)
+{
+  int ret_validation= 1;
+  int i, number_of_sans;
+  GENERAL_NAMES *sans;
+
+  DBUG_ENTER("ssl_verify_server_cert_san");
+  *errptr= NULL;
+  sans= X509_get_ext_d2i(server_cert, NID_subject_alt_name, NULL, NULL);
+  if (sans == NULL)
+    DBUG_RETURN(ret_validation);
+
+  number_of_sans= sk_GENERAL_NAME_num(sans);
+  for (i= 0; ret_validation != 0 && i < number_of_sans; ++i)
+  {
+    GENERAL_NAME *san= sk_GENERAL_NAME_value(sans, i);
+    if (san == NULL)
+    {
+      *errptr= "Failed to get item from SAN list";
+      goto error;
+    }
+    if (hostname_or_ip_len == 0)
+    {
+      /* server host name was provided, check only GEN_DNS entries */
+      if (san->type == GEN_DNS)
+      {
+        ret_validation= ssl_cmp_san_dns_name(san->d.dNSName, hostname_or_ip,
+                                             errptr);
+        if (*errptr != NULL)
+          goto error;
+      }
+    }
+    else
+    {
+      /* server IP address was provided, check only GEN_IPADD entries */
+      if (san->type == GEN_IPADD)
+      {
+        ret_validation= ssl_cmp_san_ip_address(san->d.iPAddress,
+          (const unsigned char *)hostname_or_ip, hostname_or_ip_len, errptr);
+        if (*errptr != NULL)
+          goto error;
+      }
+    }
+  } /* iterating over SAN enries */
+
+error:
+  GENERAL_NAMES_free(sans);
+
+  DBUG_RETURN(ret_validation);
+}
+
+#endif /* !defined(HAVE_X509_CHECK_FUNCTIONS) && !defined(HAVE_YASSL) */
+
 /*
   Check the server's (subject) Common Name against the
   hostname we connected to
@@ -2663,19 +2865,24 @@ mysql_get_ssl_cipher(MYSQL *mysql MY_ATTRIBUTE((unused)))
    0 Success
    1 Failed to validate server
 
- */
-
-#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
+*/
 
 static int ssl_verify_server_cert(Vio *vio, const char* server_hostname, const char **errptr)
 {
   SSL *ssl;
   X509 *server_cert= NULL;
-  char *cn= NULL;
+#ifndef HAVE_X509_CHECK_FUNCTIONS
+  const char *cn= NULL;
   int cn_loc= -1;
   ASN1_STRING *cn_asn1= NULL;
   X509_NAME_ENTRY *cn_entry= NULL;
   X509_NAME *subject= NULL;
+#endif
+#ifndef HAVE_YASSL
+  ASN1_OCTET_STRING *server_ip_address= NULL;
+  const unsigned char *ipout= NULL;
+  size_t iplen= 0;
+#endif
   int ret_validation= 1;
 
   DBUG_ENTER("ssl_verify_server_cert");
@@ -2710,58 +2917,98 @@ static int ssl_verify_server_cert(Vio *vio, const char* server_hostname, const c
     are what we expect.
   */
 
+#ifndef HAVE_YASSL
+  /* Checking if the provided server_hostname is a V4/V6 IP address */
+  server_ip_address= a2i_IPADDRESS(server_hostname);
+  if(server_ip_address != NULL)
+  {
+    iplen= ASN1_STRING_length(server_ip_address);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    ipout= (const unsigned char *) ASN1_STRING_data(server_ip_address);
+#else
+    ipout= (const unsigned char *) ASN1_STRING_get0_data(server_ip_address);
+#endif
+  }
+#endif
+
+#ifdef HAVE_X509_CHECK_FUNCTIONS
+  if (iplen == 0)
+    ret_validation= X509_check_host(server_cert, server_hostname, 0, 0, 0) != 1;
+  else
+    ret_validation= X509_check_ip(server_cert, ipout, iplen, 0) != 1;
+#else
   /*
-   Some notes for future development
-   We should check host name in alternative name first and then if needed check in common name.
-   Currently yssl doesn't support alternative name.
-   openssl 1.0.2 support X509_check_host method for host name validation, we may need to start using
-   X509_check_host in the future.
+    YaSSL will always return NULL for any call to 'X509_get_ext_d2i()'
+    and therefore the whole SAN block will be skipped and only 'CN'
+    will be checked.
   */
-
-  subject= X509_get_subject_name((X509 *) server_cert);
-  // Find the CN location in the subject
-  cn_loc= X509_NAME_get_index_by_NID(subject, NID_commonName, -1);
-  if (cn_loc < 0)
-  {
-    *errptr= "Failed to get CN location in the certificate subject";
+#ifndef HAVE_YASSL
+  ret_validation= ssl_verify_server_cert_san(server_cert,
+    iplen != 0 ? (const char*)ipout : server_hostname, iplen, errptr);
+  if (*errptr != NULL)
     goto error;
-  }
-
-  // Get the CN entry for given location
-  cn_entry= X509_NAME_get_entry(subject, cn_loc);
-  if (cn_entry == NULL)
+#endif
+  if (ret_validation != 0)
   {
-    *errptr= "Failed to get CN entry using CN location";
-    goto error;
+    subject= X509_get_subject_name(server_cert);
+    // Find the CN location in the subject
+    cn_loc= X509_NAME_get_index_by_NID(subject, NID_commonName, -1);
+    if (cn_loc < 0)
+    {
+      *errptr= "Failed to get CN location in the certificate subject";
+      goto error;
+    }
+
+    // Get the CN entry for given location
+    cn_entry= X509_NAME_get_entry(subject, cn_loc);
+    if (cn_entry == NULL)
+    {
+      *errptr= "Failed to get CN entry using CN location";
+      goto error;
+    }
+
+    // Get CN from common name entry
+    cn_asn1= X509_NAME_ENTRY_get_data(cn_entry);
+    if (cn_asn1 == NULL)
+    {
+      *errptr= "Failed to get CN from CN entry";
+      goto error;
+    }
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    cn= (const char *) ASN1_STRING_data(cn_asn1);
+#else
+    cn= (const char *) ASN1_STRING_get0_data(cn_asn1);
+#endif
+    if (cn == NULL)
+    {
+      *errptr= "Failed to get data from CN";
+      goto error;
+    }
+
+    // There should not be any NULL embedded in the CN
+    if ((size_t)ASN1_STRING_length(cn_asn1) != strlen(cn))
+    {
+      *errptr= "NULL embedded in the certificate CN";
+      goto error;
+    }
+
+    DBUG_PRINT("info", ("Server hostname in cert: %s", cn));
+    if (!strcmp(cn, server_hostname))
+    {
+      /* Success */
+      ret_validation= 0;
+    }
   }
-
-  // Get CN from common name entry
-  cn_asn1 = X509_NAME_ENTRY_get_data(cn_entry);
-  if (cn_asn1 == NULL)
-  {
-    *errptr= "Failed to get CN from CN entry";
-    goto error;
-  }
-
-  cn= (char *) ASN1_STRING_data(cn_asn1);
-
-  // There should not be any NULL embedded in the CN
-  if ((size_t)ASN1_STRING_length(cn_asn1) != strlen(cn))
-  {
-    *errptr= "NULL embedded in the certificate CN";
-    goto error;
-  }
-
-  DBUG_PRINT("info", ("Server hostname in cert: %s", cn));
-  if (!strcmp(cn, server_hostname))
-  {
-    /* Success */
-    ret_validation= 0;
-  }
-
-  *errptr= "SSL certificate validation failure";
+#endif
+  *errptr= ret_validation != 0 ? "SSL certificate validation failure" : "";
 
 error:
+#ifndef HAVE_YASSL
+  if(server_ip_address != NULL)
+    ASN1_OCTET_STRING_free(server_ip_address);
+#endif
+
   if (server_cert != NULL)
     X509_free (server_cert);
   DBUG_RETURN(ret_validation);
@@ -3174,6 +3421,22 @@ static auth_plugin_t sha256_password_client_plugin=
   NULL,
   sha256_password_auth_client
 };
+
+static auth_plugin_t caching_sha2_password_client_plugin=
+{
+  MYSQL_CLIENT_AUTHENTICATION_PLUGIN,
+  MYSQL_CLIENT_AUTHENTICATION_PLUGIN_INTERFACE_VERSION,
+  caching_sha2_password_plugin_name,
+  "Oracle Inc",
+  "SHA2 based authentication with salt",
+  {1, 0, 0},
+  "GPL",
+  NULL,
+  caching_sha2_password_init,
+  caching_sha2_password_deinit,
+  NULL,
+  caching_sha2_password_auth_client
+};
 #endif
 #ifdef AUTHENTICATION_WIN
 extern auth_plugin_t win_auth_client_plugin;
@@ -3196,6 +3459,7 @@ struct st_mysql_client_plugin *mysql_client_builtins[]=
   (struct st_mysql_client_plugin *)&clear_password_client_plugin,
 #if defined(HAVE_OPENSSL)
   (struct st_mysql_client_plugin *) &sha256_password_client_plugin,
+  (struct st_mysql_client_plugin *) &caching_sha2_password_client_plugin,
 #endif
 #ifdef AUTHENTICATION_WIN
   (struct st_mysql_client_plugin *)&win_auth_client_plugin,
@@ -3493,6 +3757,38 @@ cli_calculate_client_flag(MYSQL *mysql, const char *db, ulong client_flag)
 
 
 /**
+  Checks if any SSL option is set for libmysqld embedded server.
+
+  @param  mysql   the connection handle
+  @retval 0       success
+  @retval 1       failure
+*/
+#ifdef EMBEDDED_LIBRARY
+int embedded_ssl_check(MYSQL *mysql)
+{
+  if (mysql->options.ssl_key || mysql->options.ssl_cert ||
+      mysql->options.ssl_ca || mysql->options.ssl_capath ||
+      mysql->options.ssl_cipher ||
+      mysql->options.client_flag & CLIENT_SSL_VERIFY_SERVER_CERT ||
+      (mysql->options.extension &&
+       (mysql->options.extension->ssl_crl ||
+        mysql->options.extension->ssl_crlpath ||
+        mysql->options.extension->tls_version ||
+        mysql->options.extension->ssl_ctx_flags ||
+        mysql->options.extension->ssl_mode >= SSL_MODE_REQUIRED)))
+  {
+     set_mysql_extended_error(mysql, CR_SSL_CONNECTION_ERROR, unknown_sqlstate,
+                              ER(CR_SSL_CONNECTION_ERROR),
+                              "Embedded server libmysqld library doesn't support "
+                              "SSL connections");
+     return 1;
+  }
+  return 0;
+}
+#endif
+
+
+/**
 Establishes SSL if requested and supported.
 
 @param  mysql   the connection handle
@@ -3502,6 +3798,10 @@ Establishes SSL if requested and supported.
 static int
 cli_establish_ssl(MYSQL *mysql)
 {
+#ifdef EMBEDDED_LIBRARY
+  if (embedded_ssl_check(mysql))
+    return 1;
+#endif
 #ifdef HAVE_OPENSSL
   NET *net= &mysql->net;
 
@@ -3514,6 +3814,21 @@ cli_establish_ssl(MYSQL *mysql)
                              ER(CR_SSL_CONNECTION_ERROR),
                              "SSL is required but the server doesn't "
                              "support it");
+    goto error;
+  }
+
+  /*
+    If the ssl_mode is VERIFY_CA or VERIFY_IDENTITY, make sure that the
+    connection doesn't succeed without providing the CA certificate.
+  */
+  if (mysql->options.extension &&
+      mysql->options.extension->ssl_mode > SSL_MODE_REQUIRED &&
+      !(mysql->options.ssl_ca || mysql->options.ssl_capath))
+  {
+    set_mysql_extended_error(mysql, CR_SSL_CONNECTION_ERROR, unknown_sqlstate,
+                             ER(CR_SSL_CONNECTION_ERROR),
+                             "CA certificate is required if ssl-mode "
+                             "is VERIFY_CA or VERIFY_IDENTITY");
     goto error;
   }
 
@@ -3774,6 +4089,11 @@ static int client_mpvio_read_packet(struct st_plugin_vio *mpv, uchar **buf)
 
   /* otherwise read the data */
   pkt_len= (*mysql->methods->read_change_user_result)(mysql);
+
+  /* error while reading the change user request */
+  if (pkt_len == packet_error)
+    return (int)packet_error;
+
   mpvio->last_read_packet_len= pkt_len;
   *buf= mysql->net.read_pos;
 
@@ -3995,9 +4315,15 @@ int run_plugin_auth(MYSQL *mysql, char *data, uint data_len,
 
   /*
     The connection may be closed. If so: do not try to read from the buffer.
+    If server sends OK packet without sending auth-switch first, client side
+    auth plugin may not be able to process it correctly.
+    However, if server sends OK, it means server side authentication plugin
+    already performed required checks. Further, server side plugin did not
+    really care about plugin used by client in this case.
   */
   if (res > CR_OK && 
-      (!my_net_is_inited(&mysql->net) || mysql->net.read_pos[0] != 254))
+      (!my_net_is_inited(&mysql->net) ||
+      (mysql->net.read_pos[0] != 0 && mysql->net.read_pos[0] != 254)))
   {
     /*
       the plugin returned an error. write it down in mysql,
@@ -5492,10 +5818,14 @@ mysql_options(MYSQL *mysql,enum mysql_option option, const void *arg)
                                               arg, MYF(MY_WME));
     break;
   case MYSQL_OPT_SSL_VERIFY_SERVER_CERT:
+#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
     if (*(my_bool*) arg)
       mysql->options.client_flag|= CLIENT_SSL_VERIFY_SERVER_CERT;
     else
       mysql->options.client_flag&= ~CLIENT_SSL_VERIFY_SERVER_CERT;
+#elif defined(EMBEDDED_LIBRARY)
+    DBUG_RETURN(1);
+#endif
     break;
   case MYSQL_PLUGIN_DIR:
     EXTENSION_SET_STRING(&mysql->options, plugin_dir, arg);
@@ -5504,63 +5834,88 @@ mysql_options(MYSQL *mysql,enum mysql_option option, const void *arg)
     EXTENSION_SET_STRING(&mysql->options, default_auth, arg);
     break;
   case MYSQL_OPT_SSL_KEY:
+#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
     if (mysql->options.ssl_key)
       my_free(mysql->options.ssl_key);
-    mysql->options.ssl_key= set_ssl_option_unpack_path(&mysql->options, arg,
-                                                       SSL_MODE_PREFERRED);
+    mysql->options.ssl_key= set_ssl_option_unpack_path(arg);
+#elif defined(EMBEDDED_LIBRARY)
+    DBUG_RETURN(1);
+#endif
     break;
   case MYSQL_OPT_SSL_CERT:
+#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
     if (mysql->options.ssl_cert)
       my_free(mysql->options.ssl_cert);
-    mysql->options.ssl_cert= set_ssl_option_unpack_path(&mysql->options, arg,
-                                                        SSL_MODE_PREFERRED);
+    mysql->options.ssl_cert= set_ssl_option_unpack_path(arg);
+#elif defined(EMBEDDED_LIBRARY)
+    DBUG_RETURN(1);
+#endif
     break;
   case MYSQL_OPT_SSL_CA:
+#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
     if (mysql->options.ssl_ca)
       my_free(mysql->options.ssl_ca);
-    mysql->options.ssl_ca= set_ssl_option_unpack_path(&mysql->options, arg,
-                                                      SSL_MODE_VERIFY_CA);
+    mysql->options.ssl_ca= set_ssl_option_unpack_path(arg);
+#elif defined(EMBEDDED_LIBRARY)
+    DBUG_RETURN(1);
+#endif
     break;
   case MYSQL_OPT_SSL_CAPATH:
+#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
     if (mysql->options.ssl_capath)
       my_free(mysql->options.ssl_capath);
-    mysql->options.ssl_capath= set_ssl_option_unpack_path(&mysql->options, arg,
-                                                          SSL_MODE_VERIFY_CA);
+    mysql->options.ssl_capath= set_ssl_option_unpack_path(arg);
+#elif defined(EMBEDDED_LIBRARY)
+    DBUG_RETURN(1);
+#endif
     break;
   case MYSQL_OPT_SSL_CIPHER:
-    SET_SSL_OPTION(ssl_cipher, arg, SSL_MODE_PREFERRED);
+#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
+    SET_OPTION(ssl_cipher, arg);
+#elif defined(EMBEDDED_LIBRARY)
+    DBUG_RETURN(1);
+#endif
     break;
   case MYSQL_OPT_SSL_CRL:
+#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
     if (mysql->options.extension)
       my_free(mysql->options.extension->ssl_crl);
     else
       ALLOCATE_EXTENSIONS(&mysql->options);
     mysql->options.extension->ssl_crl=
-                   set_ssl_option_unpack_path(&mysql->options, arg,
-                                              SSL_MODE_PREFERRED);
+                   set_ssl_option_unpack_path(arg);
+#elif defined(EMBEDDED_LIBRARY)
+    DBUG_RETURN(1);
+#endif
     break;
   case MYSQL_OPT_SSL_CRLPATH:
+#if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
     if (mysql->options.extension)
       my_free(mysql->options.extension->ssl_crlpath);
     else
       ALLOCATE_EXTENSIONS(&mysql->options);
     mysql->options.extension->ssl_crlpath=
-                   set_ssl_option_unpack_path(&mysql->options, arg,
-                                              SSL_MODE_PREFERRED);
+                   set_ssl_option_unpack_path(arg);
+#elif defined(EMBEDDED_LIBRARY)
+    DBUG_RETURN(1);
+#endif
     break;
   case MYSQL_OPT_TLS_VERSION:
 #if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
-    EXTENSION_SET_SSL_STRING(&mysql->options, tls_version, arg,
-                             SSL_MODE_PREFERRED);
+    EXTENSION_SET_STRING(&mysql->options, tls_version, arg);
     if ((mysql->options.extension->ssl_ctx_flags=
            process_tls_version(mysql->options.extension->tls_version)) == -1)
       DBUG_RETURN(1);
+#elif defined(EMBEDDED_LIBRARY)
+    DBUG_RETURN(1);
 #endif
     break;
   case MYSQL_OPT_SSL_ENFORCE:
 #if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
     ENSURE_EXTENSIONS_PRESENT(&mysql->options);
     mysql->options.extension->ssl_mode= SSL_MODE_REQUIRED;
+#elif defined(EMBEDDED_LIBRARY)
+    DBUG_RETURN(1);
 #endif
     break;
   case MYSQL_OPT_SSL_MODE:
@@ -5571,10 +5926,18 @@ mysql_options(MYSQL *mysql,enum mysql_option option, const void *arg)
       mysql->options.client_flag|= CLIENT_SSL_VERIFY_SERVER_CERT;
     else
       mysql->options.client_flag&= ~CLIENT_SSL_VERIFY_SERVER_CERT;
+#elif defined(EMBEDDED_LIBRARY)
+    DBUG_RETURN(1);
 #endif
     break;
   case MYSQL_SERVER_PUBLIC_KEY:
     EXTENSION_SET_STRING(&mysql->options, server_public_key_path, arg);
+    break;
+
+  case MYSQL_OPT_GET_SERVER_PUBLIC_KEY:
+    ENSURE_EXTENSIONS_PRESENT(&mysql->options);
+    mysql->options.extension->get_server_public_key=
+      (*(my_bool *)arg) ? TRUE : FALSE;
     break;
 
   case MYSQL_OPT_CONNECT_ATTR_RESET:
@@ -5812,6 +6175,11 @@ mysql_get_option(MYSQL *mysql, enum mysql_option option, const void *arg)
   case MYSQL_SERVER_PUBLIC_KEY:
     *((char **)arg)= mysql->options.extension ?
                      mysql->options.extension->server_public_key_path : NULL;
+    break;
+  case MYSQL_OPT_GET_SERVER_PUBLIC_KEY:
+    *((my_bool *)arg)= (mysql->options.extension &&
+                        mysql->options.extension->get_server_public_key)
+                         ? TRUE : FALSE;
     break;
   case MYSQL_ENABLE_CLEARTEXT_PLUGIN:
     *((my_bool *)arg)= (mysql->options.extension &&

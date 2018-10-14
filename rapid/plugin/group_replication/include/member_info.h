@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2014, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -22,6 +22,7 @@
 */
 
 #include <string>
+#include <sstream>
 #include <map>
 #include <vector>
 #include <set>
@@ -47,6 +48,16 @@
   in the member info structure.
 */
 #define CNF_SINGLE_PRIMARY_MODE_F                 0x2
+
+/*
+  Valid values of lower_case_table_names are 0 - 2.
+  So when member has DEFAULT_NOT_RECEIVED value, it means its
+  lower_case_table_names value is not known.
+*/
+#define DEFAULT_NOT_RECEIVED_LOWER_CASE_TABLE_NAMES  65540
+#ifndef DBUG_OFF
+#define SKIP_ENCODING_LOWER_CASE_TABLE_NAMES         65541
+#endif
 
 /*
   @class Group_member_info
@@ -97,8 +108,17 @@ public:
     // length of the configuration flags: 4 bytes
     PIT_CONFIGURATION_FLAGS= 12,
 
+    // length of the conflict detection enabled: 1 byte
+    PIT_CONFLICT_DETECTION_ENABLE= 13,
+
+    // Length of the payload item: 2 bytes
+    PIT_MEMBER_WEIGHT= 14,
+
+    // Length of the payload item: 2 bytes
+    PIT_LOWER_CASE_TABLE_NAME= 15,
+
     // No valid type codes can appear after this one.
-    PIT_MAX= 13
+    PIT_MAX= 16
   };
 
   /*
@@ -144,6 +164,8 @@ public:
     @param[in] role_arg                               member role within the group
     @param[in] in_single_primary_mode                 is member in single mode
     @param[in] has_enforces_update_everywhere_checks  has member enforce update check
+    @param[in] member_weight_arg                      member weight
+    @param[in] lower_case_table_names_arg             lower case table names
    */
   Group_member_info(char* hostname_arg,
                     uint port_arg,
@@ -155,7 +177,9 @@ public:
                     ulonglong gtid_assignment_block_size_arg,
                     Group_member_info::Group_member_role role_arg,
                     bool in_single_primary_mode,
-                    bool has_enforces_update_everywhere_checks);
+                    bool has_enforces_update_everywhere_checks,
+                    uint member_weight_arg,
+                    uint lower_case_table_names_arg);
 
   /**
     Copy constructor
@@ -170,7 +194,7 @@ public:
    * @param[in] data raw data
    * @param[in] len raw data length
    */
-  Group_member_info(const uchar* data, size_t len);
+  Group_member_info(const uchar* data, uint64 len);
 
   /**
     Destructor
@@ -238,6 +262,11 @@ public:
   uint32 get_configuration_flags();
 
   /**
+    @return the global-variable lower case table names value
+  */
+  uint get_lower_case_table_names() const;
+
+  /**
     @return the member state of system variable
             group_replication_single_primary_mode
   */
@@ -288,16 +317,41 @@ public:
   static std::string get_configuration_flags_string(const uint32 configuation_flags);
 
   /**
-    @return Compare two members using "operator <"
+    @return Compare two members using member version
    */
-  static bool comparator_group_member_info(Group_member_info *m1, Group_member_info *m2);
+  static bool comparator_group_member_version(Group_member_info *m1, Group_member_info *m2);
 
   /**
-   Redefinition of operate == and <. They operate upon the uuid
+    @return Compare two members using server uuid
+   */
+  static bool comparator_group_member_uuid(Group_member_info *m1, Group_member_info *m2);
+
+  /**
+    @return Compare two members using member weight
+    @note if the weight is same, the member is sorted in
+          lexicographical order using its uuid.
+   */
+  static bool comparator_group_member_weight(Group_member_info *m1, Group_member_info *m2);
+
+  /**
+    Return true if member version is higher than other member version
+   */
+  bool has_greater_version(Group_member_info *other);
+
+  /**
+    Return true if server uuid is lower than other member server uuid
+   */
+  bool has_lower_uuid(Group_member_info *other);
+
+  /**
+    Return true if member weight is higher than other member weight
+   */
+  bool has_greater_weight(Group_member_info *other);
+
+  /**
+    Redefinition of operate ==, which operate upon the uuid
    */
   bool operator ==(Group_member_info& other);
-
-  bool operator <(Group_member_info& other);
 
   /**
     Sets this member as unreachable.
@@ -314,9 +368,36 @@ public:
    */
   bool is_unreachable();
 
+  /**
+    Update this member conflict detection to true
+   */
+  void enable_conflict_detection();
+
+  /**
+    Update this member conflict detection to false
+   */
+  void disable_conflict_detection();
+
+  /**
+    Return true if conflict detection is enable on this member
+   */
+  bool is_conflict_detection_enabled();
+
+  /**
+    Update member weight
+
+    @param[in] new_member_weight  new member_weight to set
+   */
+  void set_member_weight(uint new_member_weight);
+
+  /**
+    Return member weight
+   */
+  uint get_member_weight();
+
 protected:
   void encode_payload(std::vector<unsigned char>* buffer) const;
-  void decode_payload(const unsigned char* buffer, size_t length);
+  void decode_payload(const unsigned char* buffer, const unsigned char* end);
 
 private:
   std::string hostname;
@@ -332,6 +413,9 @@ private:
   bool unreachable;
   Group_member_role role;
   uint32 configuration_flags;
+  bool conflict_detection_enable;
+  uint member_weight;
+  uint lower_case_table_names;
 };
 
 
@@ -347,7 +431,7 @@ class Group_member_info_manager_interface
 public:
   virtual ~Group_member_info_manager_interface(){};
 
-  virtual int get_number_of_members()= 0;
+  virtual size_t get_number_of_members()= 0;
 
   /**
     Retrieves a registered Group member by its uuid
@@ -445,7 +529,34 @@ public:
     @return a vector of Group_member_info references
    */
   virtual std::vector<Group_member_info*>* decode(const uchar* to_decode,
-                                                  size_t length)= 0;
+                                                  uint64 length)= 0;
+
+  /**¬
+  Check if some member of the group has the conflict detection enable
+
+  @return true if at least one member has  conflict detection enabled
+  */
+  virtual bool is_conflict_detection_enabled()= 0;
+
+  virtual void get_primary_member_uuid(std::string &primary_member_uuid)= 0;
+
+  /**¬
+  Check if majority of the group is unreachable
+
+  This approach is optimistic, right after return the majority can be
+  reestablish or go away.
+
+  @return true if majority of the group is unreachable
+  */
+  virtual bool is_majority_unreachable()= 0;
+
+  /**
+    This method returns all ONLINE and RECOVERING members comma separated
+    host and port in string format.
+
+    @return hosts and port of all ONLINE and RECOVERING members
+  */
+  virtual std::string get_string_current_view_active_hosts() const = 0;
 };
 
 
@@ -461,7 +572,7 @@ public:
 
   virtual ~Group_member_info_manager();
 
-  int get_number_of_members();
+  size_t get_number_of_members();
 
   Group_member_info* get_group_member_info(const std::string& uuid);
 
@@ -490,7 +601,15 @@ public:
   void encode(std::vector<uchar>* to_encode);
 
   std::vector<Group_member_info*>* decode(const uchar* to_decode,
-                                          size_t length);
+                                          uint64 length);
+
+  bool is_conflict_detection_enabled();
+
+  void get_primary_member_uuid(std::string &primary_member_uuid);
+
+  bool is_majority_unreachable();
+
+  std::string get_string_current_view_active_hosts() const;
 
 private:
   void clear_members();
@@ -580,7 +699,7 @@ public:
 
 protected:
   void encode_payload(std::vector<unsigned char>* buffer) const;
-  void decode_payload(const unsigned char* buffer, size_t length);
+  void decode_payload(const unsigned char* buffer, const unsigned char* end);
 
 private:
   /**

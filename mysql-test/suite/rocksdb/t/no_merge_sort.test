@@ -1,4 +1,4 @@
---source include/have_rocksdb_as_default.inc
+--source include/have_rocksdb.inc
 
 # For Issue#117 MyRocks does merge sort with small data sets
 
@@ -14,17 +14,17 @@ while ($i < 30) {
     `b` int(11) DEFAULT NULL,
     `c` varchar(36) COLLATE latin1_bin NOT NULL,
     PRIMARY KEY (`c`)
-  );
+  ) ENGINE=ROCKSDB;
   let $j = 0;
   while ($j < 200) {
     eval insert into ti_nk values ($j, $j, md5($j));
     inc $j;
   }
 
-  select variable_value into @s from information_schema.global_status where variable_name='Sort_merge_passes';
+  select variable_value into @s from performance_schema.global_status where variable_name='Sort_merge_passes';
   eval SELECT a, b, c FROM ti_nk ORDER BY a,b,c INTO OUTFILE '$datadir/select.out';
   --remove_file $datadir/select.out
-  select case when variable_value-@s = 0 then 'true' else 'false' end as skip_merge_sort from information_schema.global_status where variable_name='Sort_merge_passes';
+  select case when variable_value-@s = 0 then 'true' else 'false' end as skip_merge_sort from performance_schema.global_status where variable_name='Sort_merge_passes';
   inc $i;
 }
 --enable_query_log

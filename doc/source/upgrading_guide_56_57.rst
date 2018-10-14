@@ -177,11 +177,11 @@ DEB-based distributions
 
 Having done the full backup (and dump if possible), stop the server: ::
 
-  $ sudo /etc/init.d/mysqld stop
+  $ sudo /etc/init.d/mysql stop
 
 and remove the installed packages with their dependencies: ::
 
-  $ sudo apt-get autoremove percona-server-server-56 percona-server-client-56
+  $ sudo apt-get autoremove percona-server-server-5.6 percona-server-client-5.6
 
 Once removed, proceed to do the modifications needed in your configuration file, as explained at the beginning of this guide.
 
@@ -236,7 +236,7 @@ This will install all the packages from the bundle. Another option is to downloa
 
 .. warning::
 
-  When installing packages manually like this, you'll need to make sure to resolve all the dependencies and install missing packages yourself.
+  When installing packages manually like this, you'll need to make sure to resolve all the dependencies and install missing packages yourself. At least the following packages should be installed before installing |Percona Server| 5.7: ``libmecab2``, ``libjemalloc1``, ``zlib1g-dev``, and ``libaio1``.
 
 The installation script will not run automatically :command:`mysql_upgrade`, so you'll need to run it yourself and restart the service afterwards.
 

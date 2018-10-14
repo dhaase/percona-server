@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, Google Inc.
 
 Portions of this file contain modifications contributed and copyrighted by
@@ -120,38 +120,6 @@ struct set_numa_interleave_t
 #else
 #define NUMA_MEMPOLICY_INTERLEAVE_IN_SCOPE
 #endif /* HAVE_LIBNUMA */
-
-#ifndef UNIV_INNOCHECKSUM
-
-static inline
-void
-_increment_page_get_statistics(buf_block_t* block, trx_t* trx)
-{
-	ulint           block_hash;
-	ulint           block_hash_byte;
-	byte            block_hash_offset;
-
-	ut_ad(block);
-	ut_ad(trx && trx->take_stats);
-
-	if (!trx->distinct_page_access_hash) {
-		trx->distinct_page_access_hash
-			= static_cast<byte *>(ut_zalloc(DPAH_SIZE,
-				mem_key_trx_distinct_page_access_hash));
-	}
-
-	block_hash = ut_hash_ulint(block->page.id.fold(), DPAH_SIZE << 3);
-	block_hash_byte = block_hash >> 3;
-	block_hash_offset = (byte) block_hash & 0x07;
-	ut_ad(block_hash_byte < DPAH_SIZE);
-	ut_ad(block_hash_offset <= 7);
-	if ((trx->distinct_page_access_hash[block_hash_byte] & ((byte) 0x01 << block_hash_offset)) == 0)
-		trx->distinct_page_access++;
-	trx->distinct_page_access_hash[block_hash_byte] |= (byte) 0x01 << block_hash_offset;
-	return;
-}
-
-#endif
 
 /*
 		IMPLEMENTATION OF THE BUFFER POOL
@@ -1382,15 +1350,16 @@ pfs_register_buffer_block(
 		rwlock = &block->lock;
 		ut_a(!rwlock->pfs_psi);
 		rwlock->pfs_psi = (PSI_server)
-			? PSI_server->init_rwlock(buf_block_lock_key, rwlock)
+			? PSI_server->init_rwlock(
+				buf_block_lock_key.m_value, rwlock)
 			: NULL;
 
 #   ifdef UNIV_DEBUG
 		rwlock = &block->debug_latch;
 		ut_a(!rwlock->pfs_psi);
 		rwlock->pfs_psi = (PSI_server)
-			? PSI_server->init_rwlock(buf_block_debug_latch_key,
-						  rwlock)
+			? PSI_server->init_rwlock(
+				buf_block_debug_latch_key.m_value, rwlock)
 			: NULL;
 #   endif /* UNIV_DEBUG */
 
@@ -1483,7 +1452,8 @@ buf_chunk_init(
 /*===========*/
 	buf_pool_t*	buf_pool,	/*!< in: buffer pool instance */
 	buf_chunk_t*	chunk,		/*!< out: chunk of buffers */
-	ulint		mem_size)	/*!< in: requested size in bytes */
+	ulint		mem_size,	/*!< in: requested size in bytes */
+	bool		populate)	/*!< in: virtual page preallocation */
 {
 	buf_block_t*	block;
 	byte*		frame;
@@ -1501,7 +1471,8 @@ buf_chunk_init(
 	DBUG_EXECUTE_IF("ib_buf_chunk_init_fails", return(NULL););
 
 	chunk->mem = buf_pool->allocator.allocate_large(mem_size,
-							&chunk->mem_pfx);
+							&chunk->mem_pfx,
+							populate);
 
 	if (UNIV_UNLIKELY(chunk->mem == NULL)) {
 
@@ -1724,6 +1695,7 @@ buf_pool_init_instance(
 /*===================*/
 	buf_pool_t*	buf_pool,	/*!< in: buffer pool instance */
 	ulint		buf_pool_size,	/*!< in: size in bytes */
+	bool		populate,	/*!< in: virtual page preallocation */
 	ulint		instance_no)	/*!< in: id of the instance */
 {
 	ulint		i;
@@ -1775,7 +1747,7 @@ buf_pool_init_instance(
 		chunk = buf_pool->chunks;
 
 		do {
-			if (!buf_chunk_init(buf_pool, chunk, chunk_size)) {
+			if (!buf_chunk_init(buf_pool, chunk, chunk_size, populate)) {
 				while (--chunk >= buf_pool->chunks) {
 					buf_block_t*	block = chunk->blocks;
 
@@ -1943,6 +1915,7 @@ dberr_t
 buf_pool_init(
 /*==========*/
 	ulint	total_size,	/*!< in: size of the total pool in bytes */
+	bool	populate,	/*!< in: virtual page preallocation */
 	ulint	n_instances)	/*!< in: number of instances */
 {
 	ulint		i;
@@ -1966,7 +1939,7 @@ buf_pool_init(
 	for (i = 0; i < n_instances; i++) {
 		buf_pool_t*	ptr	= &buf_pool_ptr[i];
 
-		if (buf_pool_init_instance(ptr, size, i) != DB_SUCCESS) {
+		if (buf_pool_init_instance(ptr, size, populate, i) != DB_SUCCESS) {
 
 			/* Free all the instances created so far. */
 			buf_pool_free(i);
@@ -2038,7 +2011,7 @@ buf_page_realloc(
 		mutex_enter(&new_block->mutex);
 
 		memcpy(new_block->frame, block->frame, UNIV_PAGE_SIZE);
-		memcpy(&new_block->page, &block->page, sizeof block->page);
+		new (&new_block->page) buf_page_t(block->page);
 
 		/* relocate LRU list */
 		ut_ad(block->page.in_LRU_list);
@@ -2831,6 +2804,9 @@ withdraw_retry:
 					= buf_pool->n_chunks;
 				warning = true;
 				buf_pool->chunks_old = NULL;
+				for (ulint j = 0; j < buf_pool->n_chunks_new; j++) {
+					buf_pool_register_chunk(&(buf_pool->chunks[j]));
+				}
 				goto calc_buf_pool_size;
 			}
 
@@ -2861,7 +2837,8 @@ withdraw_retry:
 			while (chunk < echunk) {
 				ulong	unit = srv_buf_pool_chunk_unit;
 
-				if (!buf_chunk_init(buf_pool, chunk, unit)) {
+				if (!buf_chunk_init(buf_pool, chunk, unit,
+				                    static_cast<bool>(srv_numa_interleave))) {
 
 					ib::error() << "buffer pool " << i
 						<< " : failed to allocate"
@@ -3162,7 +3139,7 @@ buf_relocate(
 	}
 #endif /* UNIV_DEBUG */
 
-	memcpy(dpage, bpage, sizeof *dpage);
+	new (dpage) buf_page_t(*bpage);
 
 	/* Important that we adjust the hazard pointer before
 	removing bpage from LRU list. */
@@ -3706,10 +3683,6 @@ buf_page_get_zip(
 	ibool		discard_attempted = FALSE;
 	ibool		must_read;
 	trx_t*		trx = innobase_get_trx_for_slow_log();
-	ulint		sec;
-	ulint		ms;
-	ib_uint64_t	start_time;
-	ib_uint64_t	finish_time;
 	buf_pool_t*	buf_pool = buf_pool_get(page_id);
 
 	buf_pool->stat.n_page_gets++;
@@ -3813,14 +3786,8 @@ got_block:
 		/* Let us wait until the read operation
 		completes */
 
-		if (UNIV_LIKELY_NULL(trx))
-		{
-			ut_ad(trx->take_stats);
-			ut_usectime(&sec, &ms);
-			start_time = (ib_uint64_t)sec * 1000000 + ms;
-		} else {
-			start_time = 0;
-		}
+		const ib_uint64_t start_time =
+		    trx_stats::start_io_read(trx, 0);
 		for (;;) {
 			enum buf_io_fix	io_fix;
 
@@ -3835,12 +3802,7 @@ got_block:
 				break;
 			}
 		}
-		if (UNIV_UNLIKELY(start_time != 0))
-		{
-			ut_usectime(&sec, &ms);
-			finish_time = (ib_uint64_t)sec * 1000000 + ms;
-			trx->io_reads_wait_timer += (ulint)(finish_time - start_time);
-		}
+		trx_stats::end_io_read(trx, start_time);
 	}
 
 #ifdef UNIV_IBUF_COUNT_DEBUG
@@ -4090,7 +4052,6 @@ buf_wait_for_read(
 	buf_block_t*	block,
 	trx_t*		trx)
 {
-	ut_ad(!trx || trx->take_stats);
 	/* Note:
 
 	We are using the block->lock to check for IO state (and a dirty read).
@@ -4101,19 +4062,10 @@ buf_wait_for_read(
 
 	if (buf_block_get_io_fix_unlocked(block) == BUF_IO_READ) {
 
-		ib_uint64_t	start_time;
-		ulint		sec;
-		ulint		ms;
-
 		/* Wait until the read operation completes */
 
-		if (UNIV_LIKELY_NULL(trx))
-		{
-			ut_usectime(&sec, &ms);
-			start_time = (ib_uint64_t)sec * 1000000 + ms;
-		} else {
-			start_time = 0;
-		}
+		const ib_uint64_t start_time =
+		    trx_stats::start_io_read(trx, 0);
 
 		for (;;) {
 			if (buf_block_get_io_fix_unlocked(block)
@@ -4126,15 +4078,7 @@ buf_wait_for_read(
 			}
 		}
 
-		if (UNIV_UNLIKELY(start_time != 0))
-		{
-			ut_usectime(&sec, &ms);
-			ib_uint64_t finish_time
-				= (ib_uint64_t)sec * 1000000 + ms;
-			trx->io_reads_wait_timer
-				+= (ulint)(finish_time - start_time);
-		}
-
+		trx_stats::end_io_read(trx, start_time);
 	}
 }
 
@@ -4769,9 +4713,7 @@ got_block:
 	ut_ad(!rw_lock_own(hash_lock, RW_LOCK_X));
 	ut_ad(!rw_lock_own(hash_lock, RW_LOCK_S));
 
-	if (UNIV_LIKELY_NULL(trx)) {
-		_increment_page_get_statistics(fix_block, trx);
-	}
+	trx_stats::inc_page_get(trx, fix_block->page.id.fold());
 
 	return(fix_block);
 }
@@ -4894,9 +4836,8 @@ buf_page_optimistic_get(
 	buf_pool = buf_pool_from_block(block);
 	buf_pool->stat.n_page_gets++;
 
-	if (UNIV_LIKELY_NULL(trx)) {
-		_increment_page_get_statistics(block, trx);
-	}
+	trx_stats::inc_page_get(trx, block->page.id.fold());
+
 	return(TRUE);
 }
 
@@ -5004,9 +4945,7 @@ buf_page_get_known_nowait(
 	buf_pool->stat.n_page_gets++;
 
 	trx_t* trx = innobase_get_trx_for_slow_log();
-	if (UNIV_LIKELY_NULL(trx)) {
-		_increment_page_get_statistics(block, trx);
-	}
+	trx_stats::inc_page_get(trx, block->page.id.fold());
 
 	return(TRUE);
 }
@@ -6726,6 +6665,7 @@ buf_stats_aggregate_pool_info(
 	}
 
 	total_info->pool_size += pool_info->pool_size;
+	total_info->pool_size_bytes += pool_info->pool_size_bytes;
 	total_info->lru_len += pool_info->lru_len;
 	total_info->old_lru_len += pool_info->old_lru_len;
 	total_info->free_list_len += pool_info->free_list_len;
@@ -6784,6 +6724,8 @@ buf_stats_get_pool_info(
 	pool_info->pool_unique_id = pool_id;
 
 	pool_info->pool_size = buf_pool->curr_size;
+
+	pool_info->pool_size_bytes = buf_pool->curr_pool_size;
 
 	pool_info->lru_len = UT_LIST_GET_LEN(buf_pool->LRU);
 

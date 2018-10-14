@@ -37,6 +37,8 @@ call mtr.add_suppression("The member contains transactions not present in the gr
 call mtr.add_suppression("The member is already leaving or joining a group.");
 call mtr.add_suppression("Skipping leave operation: member already left the group.");
 call mtr.add_suppression("Skipping leave operation: concurrent attempt to leave the group is on-going.");
+call mtr.add_suppression("Transaction cannot be executed while Group Replication is stopping.");
+call mtr.add_suppression("Run function 'before_commit' in plugin 'group_replication' failed");
 SET SESSION sql_log_bin= 1;
 
 CREATE TABLE t1 (a INT PRIMARY KEY AUTO_INCREMENT NOT NULL);
@@ -121,10 +123,10 @@ STOP GROUP_REPLICATION;
 
 --let $rpl_connection_name= server2
 --source include/rpl_connection.inc
-START GROUP_REPLICATION;
+--source include/start_group_replication_command.inc
 --let $rpl_connection_name= server3
 --source include/rpl_connection.inc
-START GROUP_REPLICATION;
+--source include/start_group_replication_command.inc
 
 # Member 2 and 3 will be on recovery
 --let $rpl_connection_name= server2
@@ -150,7 +152,7 @@ SET GLOBAL group_replication_recovery_reconnect_interval= 1;
 SET GLOBAL group_replication_allow_local_disjoint_gtids_join= 1;
 
 STOP GROUP_REPLICATION;
-START GROUP_REPLICATION;
+--source include/start_group_replication_command.inc
 
 # Member 1 will be on recovery, since all existent group members
 # are RECOVERING.

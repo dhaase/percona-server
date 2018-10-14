@@ -1,4 +1,4 @@
-/* Copyright (c) 2010, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2017, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -975,6 +975,25 @@ send_result_message:
       break;
     }
 
+    case HA_ADMIN_NEEDS_DUMP_UPGRADE:
+    {
+      char buf[MYSQL_ERRMSG_SIZE];
+      size_t length;
+
+      /*
+        mysql_upgrade avoids calling REPAIR TABLE for pre 5.0 decimal types
+        based on the text of following error message. If this error message is
+        changed, mysql_upgrade code should be fixed accordingly.
+      */
+      protocol->store(STRING_WITH_LEN("error"), system_charset_info);
+      length= my_snprintf(buf, sizeof(buf), "Table upgrade required for "
+                          "`%-.64s`.`%-.64s`. Please dump/reload table to "
+                          "fix it!", table->db, table->table_name);
+      protocol->store(buf, length, system_charset_info);
+      fatal_error=1;
+      break;
+    }
+
     default:				// Probably HA_ADMIN_INTERNAL_ERROR
       {
         char buf[MYSQL_ERRMSG_SIZE];
@@ -1014,6 +1033,9 @@ send_result_message:
 
     if (table->table)
     {
+      const bool skip_flush=
+        (operator_func == &handler::ha_analyze)
+        && (table->table->file->ha_table_flags() & HA_ONLINE_ANALYZE);
       if (table->table->s->tmp_table)
       {
         /*
@@ -1023,7 +1045,7 @@ send_result_message:
         if (open_for_modify && !open_error)
           table->table->file->info(HA_STATUS_CONST);
       }
-      else if (open_for_modify || fatal_error)
+      else if ((!skip_flush && open_for_modify) || fatal_error)
       {
         tdc_remove_table(thd, TDC_RT_REMOVE_UNUSED,
                          table->db, table->table_name, FALSE);

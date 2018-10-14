@@ -1,9 +1,9 @@
---source include/have_rocksdb_as_default.inc
+--source include/have_rocksdb.inc
 
 
 let $cf_name=cf1;
 
---source suite/rocksdb/t/rocksdb_icp.inc
+--source suite/rocksdb/include/rocksdb_icp.inc
 
 --echo #
 --echo # Issue #67: Inefficient index condition pushdown
@@ -30,7 +30,7 @@ let $save_query=
 set @count_diff =(select (value - @count) from information_schema.rocksdb_perf_context 
      where table_schema=database() and table_name='t1' and stat_type='INTERNAL_KEY_SKIPPED_COUNT');
 
---replace_column 9 #
+--replace_column 10 #
 explain 
 select * from t1 where key1=1;
 
@@ -41,4 +41,3 @@ eval $save_query;
 select @count_diff as "INTERNAL_KEY_SKIPPED_COUNT increment";
 
 drop table t0,t1;
-

@@ -41,7 +41,13 @@ static const int64_t ONE_SECOND_IN_MICROSECS = 1000 * 1000;
 static const int64_t ONE_YEAR_IN_MICROSECS =
     ONE_SECOND_IN_MICROSECS * 60 * 60 * 24 * 365;
 
-Rdb_cond_var::Rdb_cond_var() { mysql_cond_init(0, &m_cond, nullptr); }
+#ifdef HAVE_PSI_INTERFACE
+Rdb_cond_var::Rdb_cond_var(PSI_memory_key psi_key) {
+  mysql_cond_init(psi_key, &m_cond);
+}
+#else
+Rdb_cond_var::Rdb_cond_var() { mysql_cond_init(PSI_NOT_INSTRUMENTED, &m_cond); }
+#endif
 
 Rdb_cond_var::~Rdb_cond_var() { mysql_cond_destroy(&m_cond); }
 
@@ -76,7 +82,7 @@ Rdb_cond_var::WaitFor(const std::shared_ptr<TransactionDBMutex> mutex_arg,
 
   if (timeout_micros < 0)
     timeout_micros = ONE_YEAR_IN_MICROSECS;
-  set_timespec_nsec(wait_timeout, timeout_micros * 1000);
+  set_timespec_nsec(&wait_timeout, timeout_micros * 1000);
 
 #ifndef STANDALONE_UNITTEST
   PSI_stage_info old_stage;
@@ -162,7 +168,7 @@ Rdb_mutex::Rdb_mutex() {
 Rdb_mutex::~Rdb_mutex() { mysql_mutex_destroy(&m_mutex); }
 
 Status Rdb_mutex::Lock() {
-  mysql_mutex_lock(&m_mutex);
+  RDB_MUTEX_LOCK_CHECK(m_mutex);
   DBUG_ASSERT(m_old_stage_info.count(current_thd) == 0);
   return Status::OK();
 }
@@ -172,12 +178,12 @@ Status Rdb_mutex::Lock() {
 // If implementing a custom version of this class, the implementation may
 // choose to ignore the timeout.
 // Return OK on success, or other Status on failure.
-Status Rdb_mutex::TryLockFor(int64_t timeout_time __attribute__((__unused__))) {
+Status Rdb_mutex::TryLockFor(int64_t timeout_time MY_ATTRIBUTE((__unused__))) {
   /*
     Note: PThreads API has pthread_mutex_timedlock(), but mysql's
     mysql_mutex_* wrappers do not wrap that function.
   */
-  mysql_mutex_lock(&m_mutex);
+  RDB_MUTEX_LOCK_CHECK(m_mutex);
   return Status::OK();
 }
 
@@ -201,11 +207,13 @@ void Rdb_mutex::UnLock() {
         m_old_stage_info[current_thd];
     m_old_stage_info.erase(current_thd);
     /* The following will call mysql_mutex_unlock */
+    /* GOL - not in 5.7, see commentary in sql_class.h */
+    mysql_mutex_unlock(&m_mutex);
     my_core::thd_exit_cond(current_thd, old_stage.get());
     return;
   }
 #endif
-  mysql_mutex_unlock(&m_mutex);
+  RDB_MUTEX_UNLOCK_CHECK(m_mutex);
 }
 
 } // namespace myrocks

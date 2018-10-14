@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2017, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2016, Percona Inc. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
@@ -38,6 +38,7 @@ Created 2011/12/19
 #include "srv0srv.h"
 #include "page0zip.h"
 #include "trx0sys.h"
+#include "os0file.h"
 
 #ifndef UNIV_HOTBACKUP
 
@@ -346,8 +347,8 @@ buf_parallel_dblwr_make_path(void)
 	if (parallel_dblwr_buf.path)
 		return(DB_SUCCESS);
 
-	char path[FN_REFLEN];
-	const char *dir;
+	char path[FN_REFLEN + 1 /* OS_PATH_SEPARATOR */];
+	const char *dir = NULL;
 
 	ut_ad(srv_parallel_doublewrite_path);
 
@@ -429,9 +430,9 @@ static
 void
 buf_parallel_dblwr_close(void)
 {
-	if (parallel_dblwr_buf.file != OS_FILE_CLOSED) {
+	if (!parallel_dblwr_buf.file.is_closed()) {
 		os_file_close(parallel_dblwr_buf.file);
-		parallel_dblwr_buf.file = OS_FILE_CLOSED;
+		parallel_dblwr_buf.file.set_closed();
 	}
 }
 
@@ -450,7 +451,7 @@ recovery, this function loads the pages from double write buffer into memory.
 @return DB_SUCCESS or error code */
 dberr_t
 buf_dblwr_init_or_load_pages(
-	os_file_t	file,
+	pfs_os_file_t	file,
 	const char*	path)
 {
 	byte*		buf;
@@ -463,6 +464,13 @@ buf_dblwr_init_or_load_pages(
 	byte*		unaligned_read_buf;
 	ibool		reset_space_ids = FALSE;
 	recv_dblwr_t&	recv_dblwr = recv_sys->dblwr;
+
+	if (srv_read_only_mode) {
+
+		ib::info() << "Skipping doublewrite buffer processing due to "
+			"InnoDB running in read only mode";
+		return(DB_SUCCESS);
+	}
 
 	/* We do the file i/o past the buffer pool */
 
@@ -608,18 +616,20 @@ buf_dblwr_init_or_load_pages(
 			}
 
 		} else {
-
-			recv_dblwr.add(page);
+			recv_dblwr.add_to_sys(page);
 		}
 
 		page += univ_page_size.physical();
 	}
 
 	err = buf_parallel_dblwr_make_path();
-	if (err != DB_SUCCESS)
-		return(err);
+	if (err != DB_SUCCESS) {
 
-	ut_ad(parallel_dblwr_buf.file == OS_FILE_CLOSED);
+		ut_free(unaligned_read_buf);
+		return(err);
+	}
+
+	ut_ad(parallel_dblwr_buf.file.is_closed());
 	bool success;
 	parallel_dblwr_buf.file
 		= os_file_create_simple_no_error_handling(
@@ -648,7 +658,7 @@ buf_dblwr_init_or_load_pages(
 
 		os_file_set_nocache(parallel_dblwr_buf.file,
 				    parallel_dblwr_buf.path,
-				    "open");
+				    "open", false);
 
 		os_offset_t size = os_file_get_size(parallel_dblwr_buf.file);
 
@@ -709,10 +719,18 @@ buf_dblwr_init_or_load_pages(
 			return(DB_ERROR);
 		}
 
+		byte zero_page[UNIV_PAGE_SIZE_MAX] = {0};
 		for (page = recovery_buf; page < recovery_buf + size;
 		     page += UNIV_PAGE_SIZE) {
 
-			recv_dblwr.add(page);
+			/* Skip all zero pages */
+			const ulint	checksum = mach_read_from_4(
+				page + FIL_PAGE_SPACE_OR_CHKSUM);
+
+			if (checksum != 0
+                            || memcmp(page, zero_page, UNIV_PAGE_SIZE) != 0) {
+				recv_dblwr.add(page);
+			}
 		}
 		buf_parallel_dblwr_close();
 	}
@@ -757,6 +775,8 @@ buf_dblwr_process(void)
 	byte*		unaligned_read_buf;
 	recv_dblwr_t&	recv_dblwr	= recv_sys->dblwr;
 
+	ut_ad(!srv_read_only_mode);
+
 	unaligned_read_buf = static_cast<byte*>(
 		ut_malloc_nokey(2 * UNIV_PAGE_SIZE));
 
@@ -767,7 +787,7 @@ buf_dblwr_process(void)
 	     i != recv_dblwr.pages.end();
 	     ++i, ++page_no_dblwr) {
 
-		const byte*	page		= *i;
+		byte*		page		= *i;
 		ulint		page_no		= page_get_page_no(page);
 		ulint		space_id	= page_get_space_id(page);
 
@@ -833,7 +853,10 @@ buf_dblwr_process(void)
 					<< ". Trying to recover it from the"
 					<< " doublewrite buffer.";
 
-				if (buf_page_is_corrupted(
+				dberr_t	err = os_dblwr_decrypt_page(
+					space, page);
+
+				if (err != DB_SUCCESS || buf_page_is_corrupted(
 					true, page, page_size,
 					fsp_is_checksum_disabled(space_id))) {
 
@@ -1154,6 +1177,59 @@ buf_dblwr_write_block_to_datafile(
 	}
 }
 
+/** Encrypt a page in doublewerite buffer shard. The page is
+encrypted using its tablespace key.
+@param[in]	block		the buffer pool block for the page
+@param[in,out]	dblwr_page	in: unencrypted page
+				out: encrypted page (if tablespace is
+				encrypted */
+static
+void
+buf_dblwr_encrypt_page(
+	const buf_block_t*	block,
+	page_t*			dblwr_page)
+{
+	const ulint	space_id = block->page.id.space();
+	fil_space_t*	space = fil_space_acquire_silent(space_id);
+
+	if (space == NULL) {
+		/* Tablespace dropped */
+		return;
+	}
+
+	byte*		encrypted_buf = static_cast<byte*>(
+		ut_zalloc_nokey(UNIV_PAGE_SIZE));
+	ut_a(encrypted_buf != NULL);
+
+	const page_size_t	page_size(space->flags);
+	const bool 	success = os_dblwr_encrypt_page(
+		space, dblwr_page, encrypted_buf, UNIV_PAGE_SIZE);
+
+	if (success) {
+		memcpy(dblwr_page, encrypted_buf, page_size.physical());
+	}
+
+	ut_free(encrypted_buf);
+
+	fil_space_release(space);
+}
+
+/* Disable encryption of Page 0 of any tablespace or if it is system
+tablespace, do not encrypt pages upto TRX_SYS_PAGE_NO (including).
+TRX_SYS_PAGE should be not encrypted because dblwr buffer is found
+from this page
+@param[in]	block	buffer block
+@return true if encryption should be disabled for the block, else flase */
+static
+bool
+buf_dblwr_disable_encryption(
+	const buf_block_t*	block)
+{
+	return(block->page.id.page_no() == 0
+	       || (block->page.id.space() == TRX_SYS_SPACE
+		   && block->page.id.page_no() <= TRX_SYS_PAGE_NO));
+}
+
 /********************************************************************//**
 Flushes possible buffered writes from the specified partition of the
 doublewrite memory buffer to disk, and also wakes up the aio thread if
@@ -1198,6 +1274,8 @@ buf_dblwr_flush_buffered_writes(
 
 	write_buf = dblwr_shard->write_buf;
 
+	const bool	encrypt_parallel_dblwr = srv_parallel_dblwr_encrypt;
+
 	for (ulint len2 = 0, i = 0;
 	     i < dblwr_shard->first_free;
 	     len2 += UNIV_PAGE_SIZE, i++) {
@@ -1205,6 +1283,8 @@ buf_dblwr_flush_buffered_writes(
 		const buf_block_t*	block;
 
 		block = (buf_block_t*)dblwr_shard->buf_block_arr[i];
+
+		page_t*	dblwr_page = write_buf + len2;
 
 		if (buf_block_get_state(block) != BUF_BLOCK_FILE_PAGE
 		    || block->page.zip.data) {
@@ -1219,7 +1299,12 @@ buf_dblwr_flush_buffered_writes(
 
 		/* Check that the page as written to the doublewrite
 		buffer has sane LSN values. */
-		buf_dblwr_check_page_lsn(write_buf + len2);
+		buf_dblwr_check_page_lsn(dblwr_page);
+
+		if (encrypt_parallel_dblwr
+		    && !buf_dblwr_disable_encryption(block)) {
+			buf_dblwr_encrypt_page(block, dblwr_page);
+		}
 	}
 
 	len = dblwr_shard->first_free * UNIV_PAGE_SIZE;
@@ -1250,21 +1335,8 @@ buf_dblwr_flush_buffered_writes(
 	srv_stats.dblwr_pages_written.add(dblwr_shard->first_free);
 	srv_stats.dblwr_writes.inc();
 
-	/* Now flush the doublewrite buffer data to disk, unless
-	innodb_flush_method is one of O_SYNC, O_DIRECT_NO_FSYNC, or
-	ALL_O_DIRECT. */
-	switch (srv_unix_file_flush_method) {
-	case SRV_UNIX_NOSYNC:
-	case SRV_UNIX_O_DSYNC:
-	case SRV_UNIX_O_DIRECT_NO_FSYNC:
-	case SRV_UNIX_ALL_O_DIRECT:
-		break;
-	case SRV_UNIX_FSYNC:
-	case SRV_UNIX_LITTLESYNC:
-	case SRV_UNIX_O_DIRECT:
+	if (parallel_dblwr_buf.needs_flush)
 		os_file_flush(parallel_dblwr_buf.file);
-		break;
-	}
 
 	/* We know that the writes have been flushed to disk now
 	and in recovery we will find them in the doublewrite buffer
@@ -1443,6 +1515,12 @@ retry:
 	write it. This is so because we want to pad the remaining
 	bytes in the doublewrite page with zeros. */
 
+	IORequest	write_request(IORequest::WRITE);
+
+	if (buf_dblwr_disable_encryption((buf_block_t*)bpage)) {
+		write_request.disable_encryption();
+	}
+
 	if (bpage->size.is_compressed()) {
 		memcpy(buf_dblwr->write_buf + univ_page_size.physical() * i,
 		       bpage->zip.data, bpage->size.physical());
@@ -1451,7 +1529,7 @@ retry:
 		       + bpage->size.physical(), 0x0,
 		       univ_page_size.physical() - bpage->size.physical());
 
-		fil_io(IORequestWrite, true,
+		fil_io(write_request, true,
 		       page_id_t(TRX_SYS_SPACE, offset), univ_page_size, 0,
 		       univ_page_size.physical(),
 		       (void*) (buf_dblwr->write_buf
@@ -1496,7 +1574,7 @@ buf_parallel_dblwr_file_create(void)
 	if (err != DB_SUCCESS)
 		return(err);
 
-	ut_ad(parallel_dblwr_buf.file == OS_FILE_CLOSED);
+	ut_ad(parallel_dblwr_buf.file.is_closed());
 	ut_ad(parallel_dblwr_buf.recovery_buf_unaligned == NULL);
 
 	/* Set O_SYNC if innodb_flush_method == O_DSYNC. */
@@ -1514,20 +1592,27 @@ buf_parallel_dblwr_file_create(void)
 			ib::error() << "A parallel doublewrite file "
 				    << parallel_dblwr_buf.path
 				    << " found on startup.";
-			if (srv_force_recovery == SRV_FORCE_NO_LOG_REDO) {
-				ib::error() << "Since --innodb-force-recovery "
-					"is set to 6, which skips doublewrite "
-					"buffer recovery, please move away "
-					"the file above and restore it before "
-					"attempting a lower forced recovery "
-					"setting";
-			}
 		}
 		return(DB_ERROR);
 	}
 
-	os_file_set_nocache(parallel_dblwr_buf.file, parallel_dblwr_buf.path,
-			    "create");
+	const bool o_direct_set
+		= os_file_set_nocache(parallel_dblwr_buf.file,
+				      parallel_dblwr_buf.path,
+				      "create", false);
+	switch (srv_unix_file_flush_method) {
+	case SRV_UNIX_NOSYNC:
+	case SRV_UNIX_O_DSYNC:
+	case SRV_UNIX_O_DIRECT_NO_FSYNC:
+	case SRV_UNIX_ALL_O_DIRECT:
+		parallel_dblwr_buf.needs_flush = !o_direct_set;
+		break;
+	case SRV_UNIX_FSYNC:
+	case SRV_UNIX_LITTLESYNC:
+	case SRV_UNIX_O_DIRECT:
+		parallel_dblwr_buf.needs_flush = true;
+		break;
+	}
 
 	success = os_file_set_size(parallel_dblwr_buf.path,
 				   parallel_dblwr_buf.file, size, false);
@@ -1550,8 +1635,7 @@ the disk file.
 dberr_t
 buf_parallel_dblwr_create(void)
 {
-	if (parallel_dblwr_buf.file != OS_FILE_CLOSED
-	    || srv_read_only_mode) {
+	if (!parallel_dblwr_buf.file.is_closed() || srv_read_only_mode) {
 
 		ut_ad(parallel_dblwr_buf.recovery_buf_unaligned == NULL);
 		return(DB_SUCCESS);

@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2005, 2015, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2005, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -145,7 +145,8 @@ static int partition_initialize(void *p)
   partition_hton->flags= HTON_NOT_USER_SELECTABLE |
                          HTON_HIDDEN |
                          HTON_TEMPORARY_NOT_SUPPORTED |
-                         HTON_SUPPORTS_CLUSTERED_KEYS;
+                         HTON_SUPPORTS_CLUSTERED_KEYS |
+                         HTON_SUPPORTS_COMPRESSED_COLUMNS;
 #ifdef HAVE_PSI_INTERFACE
   init_partition_psi_keys();
 #endif
@@ -776,6 +777,33 @@ create_error:
   DBUG_RETURN(error);
 }
 
+/** This function reads zip dict-related info from partition handlers.
+It may do nothing if individual handlers do not support COMPRESSED_COLUMNS.
+
+@param    thd          Thread handler.
+@param    part_name    Must be always NULL.
+*/
+void ha_partition::update_field_defs_with_zip_dict_info(THD* thd,
+                                                        const char* part_name)
+{
+  DBUG_ENTER("ha_partition::update_field_defs_with_zip_dict_info");
+  DBUG_ASSERT(part_name == NULL);
+  char full_name[FN_REFLEN];
+  create_partition_name(full_name, table_share->path.str, m_name_buffer_ptr,
+                        NORMAL_PART_NAME, FALSE);
+
+  /*
+  As table structure is the same for all partitions,
+  we can use the first partition for this function.
+  */
+  DBUG_ASSERT(m_file);
+  DBUG_ASSERT(m_file[0]);
+
+  m_file[0]->update_field_defs_with_zip_dict_info(thd, full_name);
+
+  DBUG_VOID_RETURN;
+}
+
 
 /*
   Optimize table
@@ -815,7 +843,17 @@ int ha_partition::analyze(THD *thd, HA_CHECK_OPT *check_opt)
 {
   DBUG_ENTER("ha_partition::analyze");
 
-  DBUG_RETURN(handle_opt_partitions(thd, check_opt, ANALYZE_PARTS));
+  int result= handle_opt_partitions(thd, check_opt, ANALYZE_PARTS);
+
+  if ((result == 0) && m_file[0]
+      && (m_file[0]->ha_table_flags() & HA_ONLINE_ANALYZE))
+  {
+    /* If this is ANALYZE TABLE that will not force table definition cache
+       eviction, update statistics for the partition handler. */
+    this->info(HA_STATUS_CONST | HA_STATUS_VARIABLE | HA_STATUS_NO_LOCK);
+  }
+
+  DBUG_RETURN(result);
 }
 
 
@@ -1417,7 +1455,6 @@ void ha_partition::update_create_info(HA_CREATE_INFO *create_info)
   uint num_parts = num_subparts ? m_file_tot_parts / num_subparts
                                 : m_file_tot_parts;
   HA_CREATE_INFO dummy_info;
-  memset(&dummy_info, 0, sizeof(dummy_info));
 
   /*
   Since update_create_info() can be called from mysql_prepare_alter_table()
@@ -5585,6 +5622,21 @@ uint ha_partition::min_of_the_max_uint(
 }
 
 
+uint ha_partition::min_of_the_max_uint(HA_CREATE_INFO *create_info,
+                       uint (handler::*operator_func)(HA_CREATE_INFO *) const) const
+{
+  handler **file;
+  uint min_of_the_max= ((*m_file)->*operator_func)(create_info);
+
+  for (file= m_file+1; *file; file++)
+  {
+    uint tmp= ((*file)->*operator_func)(create_info);
+    set_if_smaller(min_of_the_max, tmp);
+  }
+  return min_of_the_max;
+}
+
+
 uint ha_partition::max_supported_key_parts() const
 {
   return min_of_the_max_uint(&handler::max_supported_key_parts);
@@ -5597,9 +5649,11 @@ uint ha_partition::max_supported_key_length() const
 }
 
 
-uint ha_partition::max_supported_key_part_length() const
+uint ha_partition::max_supported_key_part_length(HA_CREATE_INFO
+                                                 *create_info) const
 {
-  return min_of_the_max_uint(&handler::max_supported_key_part_length);
+  return
+  min_of_the_max_uint(create_info, &handler::max_supported_key_part_length);
 }
 
 
@@ -6253,6 +6307,15 @@ void ha_partition::rpl_after_update_rows()
 bool ha_partition::rpl_lookup_rows()
 {
   return m_file[0]->rpl_lookup_rows();
+}
+
+/*
+  Query storage engine to see if it can support handling specific replication
+  method in its current configuration.
+*/
+bool ha_partition::rpl_can_handle_stm_event() const
+{
+  return m_file[0]->rpl_can_handle_stm_event();
 }
 
 struct st_mysql_storage_engine partition_storage_engine=

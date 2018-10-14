@@ -31,17 +31,23 @@ JEMALLOC_LOCATION=""
 HOTBACKUP_LOCATION=""
 FORCE_MYCNF=0
 FORCE_ENVFILE=0
+DOCKER=0
 
 SCRIPT_PWD=$(cd `dirname $0` && pwd)
 MYSQL_CLIENT_BIN="${SCRIPT_PWD}/mysql"
 MYSQL_DEFAULTS_BIN="${SCRIPT_PWD}/my_print_defaults"
-SYSTEMD_ENV_FILE="/etc/sysconfig/mysql"
+if [ -f /etc/redhat-release ]
+then
+  SYSTEMD_ENV_FILE="/etc/sysconfig/mysql"
+else
+  SYSTEMD_ENV_FILE="/etc/default/mysql"
+fi
 
 # Check if we have a functional getopt(1)
 if ! getopt --test
   then
-  go_out="$(getopt --options=u:p::S:h:P:edbrfm \
-  --longoptions=user:,password::,socket:,host:,port:,enable,disable,enable-backup,disable-backup,help,defaults-file:,force-envfile,force-mycnf \
+  go_out="$(getopt --options=u:p::S:h:P:edbrfmD \
+  --longoptions=user:,password::,socket:,host:,port:,enable,disable,enable-backup,disable-backup,help,defaults-file:,force-envfile,force-mycnf,docker \
   --name="$(basename "$0")" -- "$@")"
   test $? -eq 0 || exit 1
   eval set -- $go_out
@@ -116,7 +122,12 @@ do
     shift
     FORCE_ENVFILE=1
     ;;
+    -D | --docker )
+    shift
+    DOCKER=1
+    ;;
     --help )
+    printf "WARNING: This script is deprecated and will be removed in 8.0. You can use ps-admin script which has more functionality.\n\n"
     printf "This script is used for installing and uninstalling TokuDB plugin for Percona Server 5.7.\n"
     printf "It can also be used to install or uninstall the Percona TokuBackup plugin (requires mysql server restart).\n"
     printf "If transparent huge pages are enabled on the system it adds thp-setting=never option to my.cnf\n"
@@ -134,9 +145,9 @@ do
     printf "  --disable, d\t\t\t\t disable TokuDB plugin and remove thp-setting=never option in my.cnf\n"
     printf "\t\t\t\t\t (this option includes --disable-backup option)\n"
     printf "  --disable-backup, r\t\t\t disable Percona TokuBackup and remove preload-hotbackup option in my.cnf\n"
-    printf "  --force-envfile, f\t\t\t force usage of /etc/sysconfig/mysql instead of my.cnf\n"
+    printf "  --force-envfile, f\t\t\t force usage of $SYSTEMD_ENV_FILE instead of my.cnf\n"
     printf "\t\t\t\t\t (use if autodetect doesn't work on distro with systemd and without mysqld_safe)\n"
-    printf "  --force-mycnf, m\t\t\t force usage of my.cnf instead of /etc/sysconfig/mysql\n"
+    printf "  --force-mycnf, m\t\t\t force usage of my.cnf instead of $SYSTEMD_ENV_FILE\n"
     printf "\t\t\t\t\t (use if autodetect doesn't work where mysqld_safe is used for running server)\n"
     printf "  --help\t\t\t\t show this help\n\n"
     printf "For TokuDB requirements and manual steps for installation please visit this webpage:\n"
@@ -147,10 +158,12 @@ do
 done
 
 # Make sure only root can run this script
-if [ $(id -u) -ne 0 ]; then
+if [ $(id -u) -ne 0 -a $DOCKER = 0 ]; then
   echo "ERROR: This script must be run as root!" 1>&2
   exit 1
 fi
+
+printf "WARNING: This script is deprecated and will be removed in 8.0. You can use ps-admin script which has more functionality.\n\n"
 
 if [ $ENABLE = 1 -a $DISABLE = 1 ]; then
   printf "ERROR: Only --enable OR --disable can be specified - not both!\n"
@@ -252,7 +265,7 @@ if [ $FULL_SYSTEMD_MODE = 1 -a $ENABLE_TOKUBACKUP = 1 ]; then
 fi
 
 # Check if server is running with jemalloc - if not warn that restart is needed (only when running with mysqld_safe)
-if [ $ENABLE = 1 -a $FULL_SYSTEMD_MODE = 0 ]; then
+if [ $ENABLE = 1 -a $FULL_SYSTEMD_MODE = 0 -a $DOCKER = 0 ]; then
   printf "Checking if Percona Server is running with jemalloc enabled...\n"
   grep -qc jemalloc /proc/${PID_NUM}/environ || ldd $(which mysqld) | grep -qc jemalloc
   JEMALLOC_STATUS=$?
@@ -319,7 +332,7 @@ if [ $ENABLE = 1 -o $DISABLE = 1 ]; then
       printf "INFO: Option thp-setting=never is set in the config file.\n\n"
     fi
   else
-    printf "Checking if THP_SETTING variable is set to never or madvise in /etc/sysconfig/mysql...\n"
+    printf "Checking if THP_SETTING variable is set to never or madvise in $SYSTEMD_ENV_FILE...\n"
     if [ -f $SYSTEMD_ENV_FILE ]; then
       STATUS_THP_MYCNF=$(cat $SYSTEMD_ENV_FILE|grep -c -e "THP_SETTING=never\|THP_SETTING=madvise")
     else
@@ -444,7 +457,7 @@ elif [ $ENABLE = 1 -a $STATUS_JEMALLOC_CONFIG = 0 ] || [ $ENABLE_TOKUBACKUP = 1 
   # Add desired LD_PRELOAD into config file
   if [ ! -f $SYSTEMD_ENV_FILE ]; then
     echo "LD_PRELOAD=${NEW_LD_PRELOAD}" > $SYSTEMD_ENV_FILE
-  elif [ $(grep -c LD_PRELOAD /etc/sysconfig/mysql) = 0 ]; then
+  elif [ $(grep -c LD_PRELOAD $SYSTEMD_ENV_FILE) = 0 ]; then
     echo "LD_PRELOAD=${NEW_LD_PRELOAD}" >> $SYSTEMD_ENV_FILE
   else
     sed -i '/^LD_PRELOAD=/ s:$: '"${NEW_LD_PRELOAD}"':' $SYSTEMD_ENV_FILE

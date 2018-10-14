@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2013, 2017, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -52,7 +52,8 @@ Binlog_sender::Binlog_sender(THD *thd, const char *start_file,
     m_diag_area(false),
     m_errmsg(NULL), m_errno(0), m_last_file(NULL), m_last_pos(0),
     m_half_buffer_size_req_counter(0), m_new_shrink_size(PACKET_MIN_SIZE),
-    m_flag(flag), m_observe_transmission(false), m_transmit_started(false)
+    m_fdle(NULL), m_flag(flag), m_observe_transmission(false),
+    m_transmit_started(false)
   {}
 
 void Binlog_sender::init()
@@ -196,7 +197,7 @@ void Binlog_sender::run()
   IO_CACHE log_cache;
   my_off_t start_pos= m_start_pos;
   const char *log_file= m_linfo.log_file_name;
-
+  bool is_index_file_reopened_on_binlog_disable= false;
   init();
 
   while (!has_error() && !m_thd->killed)
@@ -230,9 +231,40 @@ void Binlog_sender::run()
 
     THD_STAGE_INFO(m_thd,
                    stage_finished_reading_one_binlog_switching_to_next_binlog);
-    int error= mysql_bin_log.find_next_log(&m_linfo, 1);
+    DBUG_EXECUTE_IF("waiting_for_disable_binlog",
+		    {
+		    const char act[]= "now "
+		    "signal dump_thread_reached_wait_point "
+		    "wait_for continue_dump_thread no_clear_event";
+		    DBUG_ASSERT(!debug_sync_set_action(current_thd,
+						       STRING_WITH_LEN(act)));
+		    };);
+    mysql_bin_log.lock_index();
+    if (!mysql_bin_log.is_open())
+    {
+      if (mysql_bin_log.open_index_file(mysql_bin_log.get_index_fname(),
+					log_file, FALSE))
+      {
+        set_fatal_error("Binary log is not open and failed to open index file "
+                        "to retrieve next file.");
+        mysql_bin_log.unlock_index();
+        break;
+      }
+      is_index_file_reopened_on_binlog_disable= true;
+    }
+    int error= mysql_bin_log.find_next_log(&m_linfo, 0);
+    mysql_bin_log.unlock_index();
     if (unlikely(error))
     {
+      DBUG_EXECUTE_IF("waiting_for_disable_binlog",
+		      {
+		      const char act[]= "now signal consumed_binlog";
+		      DBUG_ASSERT(!debug_sync_set_action(current_thd,
+							 STRING_WITH_LEN(act)));
+		      };);
+      if (is_index_file_reopened_on_binlog_disable)
+        mysql_bin_log.close(LOG_CLOSE_INDEX, true/*need_lock_log=true*/,
+                            true/*need_lock_index=true*/);
       set_fatal_error("could not find next log");
       break;
     }
@@ -898,8 +930,8 @@ inline int Binlog_sender::reset_transmit_packet(ushort flags, size_t event_len)
                       event_len, m_packet.alloced_length()));
   DBUG_ASSERT(m_packet.alloced_length() >= PACKET_MIN_SIZE);
 
-  m_packet.length(0);  // size of the string
-  m_packet.qs_append('\0');
+  m_packet.length(0);  // size of the content
+  m_packet.qs_append('\0'); // Set this as an OK packet
 
   /* reserve and set default header */
   if (m_observe_transmission &&
@@ -925,6 +957,13 @@ int Binlog_sender::send_format_description_event(IO_CACHE *log_cache,
   DBUG_ENTER("Binlog_sender::send_format_description_event");
   uchar* event_ptr;
   uint32 event_len;
+
+  m_fdle.reset(new Format_description_log_event(4));
+  if (m_fdle == NULL)
+  {
+    set_fatal_error("Out-of-memory");
+    DBUG_RETURN(1);
+  }
 
   if (read_event(log_cache, binary_log::BINLOG_CHECKSUM_ALG_OFF, &event_ptr,
                  &event_len))
@@ -999,7 +1038,71 @@ int Binlog_sender::send_format_description_event(IO_CACHE *log_cache,
   if (event_checksum_on() && event_updated)
     calc_event_checksum(event_ptr, event_len);
 
-  DBUG_RETURN(send_packet());
+  if (m_event_checksum_alg != binary_log::BINLOG_CHECKSUM_ALG_UNDEF &&
+      m_event_checksum_alg != binary_log::BINLOG_CHECKSUM_ALG_OFF)
+    event_len-= BINLOG_CHECKSUM_LEN;
+
+  Format_description_log_event *new_fdle= NULL;
+
+  new_fdle= new Format_description_log_event(reinterpret_cast<char*>(event_ptr), event_len, m_fdle.get());
+  
+  if (new_fdle == NULL)
+  {
+    set_fatal_error("Out-of-memory");
+    DBUG_RETURN(1);
+  }
+  m_fdle.reset(new_fdle);
+
+  if (send_packet())
+    DBUG_RETURN(1);
+
+  char header_buffer[LOG_EVENT_MINIMAL_HEADER_LEN];
+  // Let's check if next event is Start encryption event
+  if (Log_event::peek_event_header(header_buffer, log_cache))
+    DBUG_RETURN(1);
+
+  // peek_event_header actually moves the log_cache->read_pos, thus we need to rewind
+  log_cache->read_pos-= LOG_EVENT_MINIMAL_HEADER_LEN;
+
+  if (static_cast<uchar>(header_buffer[EVENT_TYPE_OFFSET]) == binary_log::START_ENCRYPTION_EVENT)
+  {
+    event_ptr= NULL;
+    my_off_t log_pos= my_b_tell(log_cache);
+
+    if (read_event(log_cache, m_event_checksum_alg, &event_ptr,
+                   &event_len))
+      DBUG_RETURN(1);
+
+    if (m_event_checksum_alg != binary_log::BINLOG_CHECKSUM_ALG_UNDEF &&
+        m_event_checksum_alg != binary_log::BINLOG_CHECKSUM_ALG_OFF)
+      event_len-= BINLOG_CHECKSUM_LEN;
+
+    DBUG_ASSERT(event_ptr[EVENT_TYPE_OFFSET] == binary_log::START_ENCRYPTION_EVENT);
+    Start_encryption_log_event sele(reinterpret_cast<char*>(event_ptr), event_len, m_fdle.get());
+        
+    if (!sele.is_valid())
+    {
+      set_fatal_error("Start encryption log event is invalid");
+      DBUG_RETURN(1);
+    }
+
+    if (m_fdle->start_decryption(&sele))
+    {
+      set_fatal_error("Could not decrypt binlog: encryption key error");
+      DBUG_RETURN(1);
+    }
+
+    if (start_pos <= BIN_LOG_HEADER_SIZE)
+    {
+      log_pos= my_b_tell(log_cache);
+      // We have read start encryption event from master binlog, but we have
+      // not sent it to slave. We need to inform slave that master position
+      // has advanced.
+      if (unlikely(send_heartbeat_event(log_pos)))
+         DBUG_RETURN(1);
+    }
+  }
+  DBUG_RETURN(0);
 }
 
 int Binlog_sender::has_previous_gtid_log_event(IO_CACHE *log_cache,
@@ -1037,6 +1140,8 @@ const char* Binlog_sender::log_read_error_msg(int error)
     return "binlog truncated in the middle of event; consider out of disk space on master";
   case LOG_READ_CHECKSUM_FAILURE:
     return "event read from binlog did not pass crc check";
+  case LOG_READ_DECRYPT:
+    return "Event decryption failure";
   default:
     return "unknown error reading log event on the master";
   }
@@ -1050,6 +1155,9 @@ inline int Binlog_sender::read_event(IO_CACHE *log_cache, enum_binlog_checksum_a
   size_t event_offset;
   char header[LOG_EVENT_MINIMAL_HEADER_LEN];
   int error= 0;
+#ifndef DBUG_OFF
+  const char *packet_buffer= NULL;
+#endif
 
   if ((error= Log_event::peek_event_length(event_len, log_cache, header)))
     goto read_error;
@@ -1058,6 +1166,9 @@ inline int Binlog_sender::read_event(IO_CACHE *log_cache, enum_binlog_checksum_a
     DBUG_RETURN(1);
 
   event_offset= m_packet.length();
+#ifndef DBUG_OFF
+  packet_buffer= m_packet.ptr();
+#endif
 
   DBUG_EXECUTE_IF("dump_thread_before_read_event",
                   {
@@ -1070,16 +1181,20 @@ inline int Binlog_sender::read_event(IO_CACHE *log_cache, enum_binlog_checksum_a
     packet is big enough to read the event, since we have reallocated based
     on the length stated in the event header.
   */
-  if ((error= Log_event::read_log_event(log_cache, &m_packet, NULL, checksum_alg,
+  if ((error= Log_event::read_log_event(log_cache, &m_packet, m_fdle.get(), NULL, checksum_alg,
                                         NULL, NULL, header)))
     goto read_error;
 
   set_last_pos(my_b_tell(log_cache));
 
   /*
-    Only set event_ptr after reading the event, as the packed might change
-    size (and also changing its pointer) inside read_log_event().
+    As we pre-allocate the buffer to store the event at reset_transmit_packet,
+    the buffer should not be changed while calling read_log_event (unless binlog
+    encryption is on), even knowing that it might call functions to replace the
+    buffer by one with the size to fit the event. When encryption is on - the buffer
+    will be replaced with memory allocated for storing decrypted data.
   */
+  DBUG_ASSERT(encrypt_binlog || packet_buffer == m_packet.ptr());
   *event_ptr= (uchar *)m_packet.ptr() + event_offset;
 
   DBUG_PRINT("info",
@@ -1240,11 +1355,12 @@ inline bool Binlog_sender::grow_packet(size_t extra_size)
     DBUG_RETURN(true);
 
   /* Grow the buffer if needed. */
-  if (needed_buffer_size >= cur_buffer_size)
+  if (needed_buffer_size > cur_buffer_size)
   {
     size_t new_buffer_size;
-    if (calc_buffer_size(cur_buffer_size, needed_buffer_size,
-                         PACKET_GROW_FACTOR, &new_buffer_size))
+    new_buffer_size= calc_grow_buffer_size(cur_buffer_size, needed_buffer_size);
+
+    if (!new_buffer_size)
       DBUG_RETURN(true);
 
     if (m_packet.mem_realloc(new_buffer_size))
@@ -1254,9 +1370,7 @@ inline bool Binlog_sender::grow_packet(size_t extra_size)
      Calculates the new, smaller buffer, size to use the next time
      one wants to shrink the buffer.
     */
-    if (calc_buffer_size(m_new_shrink_size, PACKET_MIN_SIZE,
-                         PACKET_SHRINK_FACTOR, &m_new_shrink_size))
-      DBUG_RETURN(true);
+    calc_shrink_buffer_size(new_buffer_size);
   }
 
   DBUG_RETURN(false);
@@ -1296,8 +1410,7 @@ inline bool Binlog_sender::shrink_packet()
            Calculates the new, smaller buffer, size to use the next time
            one wants to shrink the buffer.
          */
-        res= calc_buffer_size(m_new_shrink_size, PACKET_MIN_SIZE,
-                              PACKET_SHRINK_FACTOR, &m_new_shrink_size);
+        calc_shrink_buffer_size(m_new_shrink_size);
 
         /* Reset the counter. */
         m_half_buffer_size_req_counter= 0;
@@ -1316,14 +1429,13 @@ inline bool Binlog_sender::shrink_packet()
   DBUG_RETURN(res);
 }
 
-inline bool Binlog_sender::calc_buffer_size(size_t current_size,
-                                            size_t min_size,
-                                            float factor,
-                                            size_t *new_val)
+inline size_t Binlog_sender::calc_grow_buffer_size(size_t current_size,
+                                                   size_t min_size)
 {
   /* Check that a sane minimum buffer size was requested.  */
-  if (min_size < PACKET_MIN_SIZE || min_size > PACKET_MAX_SIZE)
-    return true;
+  DBUG_ASSERT(min_size > PACKET_MIN_SIZE);
+  if (min_size > PACKET_MAX_SIZE)
+    return 0;
 
   /*
      Even if this overflows (PACKET_MAX_SIZE == UINT_MAX32) and
@@ -1335,11 +1447,19 @@ inline bool Binlog_sender::calc_buffer_size(size_t current_size,
    */
   size_t new_size= static_cast<size_t>(
     std::min(static_cast<double>(PACKET_MAX_SIZE),
-             static_cast<double>(current_size * factor)));
+             static_cast<double>(current_size * PACKET_GROW_FACTOR)));
 
-  *new_val= ALIGN_SIZE(std::max(new_size, min_size));
+  new_size= ALIGN_SIZE(std::max(new_size, min_size));
 
-  return false;
+  return new_size;
 }
 
+void Binlog_sender::calc_shrink_buffer_size(size_t current_size)
+{
+  size_t new_size= static_cast<size_t>(
+      std::max(static_cast<double>(PACKET_MIN_SIZE),
+               static_cast<double>(current_size * PACKET_SHRINK_FACTOR)));
+
+  m_new_shrink_size= ALIGN_SIZE(new_size);
+}
 #endif // HAVE_REPLICATION

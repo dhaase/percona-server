@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, 2015, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2011, 2017, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -351,7 +351,9 @@ void OptRangeTest::check_use_count(SEL_TREE *tree)
   {
     SEL_ARG *cur_range= tree->keys[i];
     if (cur_range != NULL)
+    {
       EXPECT_FALSE(cur_range->test_use_count(cur_range));
+    }
   }
 
   if (!tree->merges.is_empty())
@@ -1674,7 +1676,7 @@ TEST_F(OptRangeTest, KeyOr2)
 
   EXPECT_EQ(0UL, fld1_20->keys[1]->use_count);
   EXPECT_NE(null_arg, fld1_20->keys[1]->next_key_part);
-  EXPECT_EQ(1UL, fld1_20->keys[1]->next_key_part->use_count);
+  EXPECT_EQ(0UL, fld1_20->keys[1]->next_key_part->use_count);
 }
 
 class Mock_SEL_ARG : public SEL_ARG

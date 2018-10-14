@@ -1,8 +1,10 @@
---source include/have_rocksdb_as_default.inc
+--source include/have_rocksdb.inc
 
---disable_warnings
-DROP TABLE IF EXISTS t1;
---enable_warnings
+#
+# Information Schema transaction information
+#
+--let i_s_plugin=rocksdb_trx
+--source suite/rocksdb/include/i_s_basic.inc
 
 set session transaction isolation level read committed;
 create table t1 (a int) engine=rocksdb;

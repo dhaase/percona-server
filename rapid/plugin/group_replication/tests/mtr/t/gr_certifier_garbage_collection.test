@@ -89,14 +89,6 @@ UPDATE t1 SET c1=2 WHERE c1=1;
 
 --let $wait_condition= SELECT Last_Conflict_Free_Transaction = '8a94f357-aab4-11df-86ab-c80aa9422222:5' from performance_schema.replication_group_member_stats
 --source include/wait_condition.inc
-if (!$success)
-{
-  --echo Current connection: $CURRENT_CONNECTION
-  --query_vertical SELECT * FROM performance_schema.replication_connection_status
-  --query_vertical SELECT * FROM performance_schema.replication_group_members
-  --die Timeout in wait_condition.inc
-}
-
 
 --echo
 --echo ############################################################
@@ -112,8 +104,8 @@ if (!$success)
 
 --connection server1
 --let $count_transactions_validating= query_get_value(SELECT Count_transactions_rows_validating from performance_schema.replication_group_member_stats, Count_transactions_rows_validating, 1)
---let $assert_text= 'Count_transactions_rows_validating must be 2'
---let $assert_cond= $count_transactions_validating = 2
+--let $assert_text= 'Count_transactions_rows_validating must be 4'
+--let $assert_cond= $count_transactions_validating = 4
 --source include/assert.inc
 
 --let $transactions_committed_all_members= query_get_value(SELECT Transactions_committed_all_members from performance_schema.replication_group_member_stats, Transactions_committed_all_members, 1)
@@ -123,8 +115,8 @@ if (!$success)
 
 --connection server2
 --let $count_transactions_validating= query_get_value(SELECT Count_transactions_rows_validating from performance_schema.replication_group_member_stats, Count_transactions_rows_validating, 1)
---let $assert_text= 'Count_transactions_rows_validating must be 2'
---let $assert_cond= $count_transactions_validating = 2
+--let $assert_text= 'Count_transactions_rows_validating must be 4'
+--let $assert_cond= $count_transactions_validating = 4
 --source include/assert.inc
 
 --let $transactions_committed_all_members= query_get_value(SELECT Transactions_committed_all_members from performance_schema.replication_group_member_stats, Transactions_committed_all_members, 1)

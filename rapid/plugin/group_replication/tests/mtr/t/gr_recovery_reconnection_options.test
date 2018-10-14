@@ -57,6 +57,7 @@ INSERT INTO t1 VALUES (1);
 
 SET SESSION sql_log_bin= 0;
 call mtr.add_suppression("There was an error when connecting to the donor*");
+call mtr.add_suppression("For details please check performance_schema.replication_connection_status table and error log messages of Slave I/O for channel group_replication_recovery.");
 SET SESSION sql_log_bin= 1;
 
 SET @debug_save_rec_int= @@GLOBAL.group_replication_recovery_reconnect_interval;
@@ -136,7 +137,7 @@ SET GLOBAL group_replication_recovery_retry_count= 31536001;
 --enable_warnings
 
 --eval SET GLOBAL group_replication_group_name= "$group_replication_group_name";
-START GROUP_REPLICATION;
+--source include/start_group_replication_command.inc
 
 #give it time to fail twice and sleep
 --sleep 10

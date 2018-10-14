@@ -21,9 +21,10 @@
 #include <string>
 
 /* MySQL includes */
-#include "./my_global.h"
-#include <mysql/psi/mysql_table.h>
-#include <mysql/thread_pool_priv.h>
+#include "my_global.h"
+#include "my_thread.h"
+#include "mysql/psi/mysql_table.h"
+#include "mysql/thread_pool_priv.h"
 
 /* MyRocks header files */
 #include "./rdb_utils.h"
@@ -39,7 +40,7 @@ private:
   // Make sure we run only once
   std::atomic_bool m_run_once;
 
-  pthread_t m_handle;
+  my_thread_handle m_handle;
 
 protected:
   mysql_mutex_t m_signal_mutex;
@@ -63,7 +64,7 @@ public:
 
   void signal(const bool &stop_thread = false);
 
-  int join() { return pthread_join(m_handle, nullptr); }
+  int join() { return my_thread_join(&m_handle, nullptr); }
 
   void uninit();
 
@@ -93,9 +94,11 @@ public:
   virtual void run() override;
 
   void request_save_stats() {
-    mysql_mutex_lock(&m_signal_mutex);
+    RDB_MUTEX_LOCK_CHECK(m_signal_mutex);
+
     m_save_stats = true;
-    mysql_mutex_unlock(&m_signal_mutex);
+
+    RDB_MUTEX_UNLOCK_CHECK(m_signal_mutex);
   }
 };
 

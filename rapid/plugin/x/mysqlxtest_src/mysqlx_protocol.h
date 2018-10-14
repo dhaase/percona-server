@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2016 Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2018, Oracle and/or its affiliates. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
@@ -45,7 +45,6 @@
 
 #include "ngs_common/protocol_protobuf.h"
 #include "mysqlx_connection.h"
-#include "mysqlx_common.h"
 
 
 namespace mysqlx
@@ -223,7 +222,7 @@ namespace mysqlx
     IPv6,
   };
 
-  class MYSQLXTEST_PUBLIC XProtocol : public ngs::enable_shared_from_this<XProtocol>
+  class XProtocol : public ngs::enable_shared_from_this<XProtocol>
   {
   public:
     XProtocol(const Ssl_config &ssl_config, const std::size_t timeout, const bool dont_wait_for_disconnect = true, const Internet_protocol ip_mode = IPv4);
@@ -294,6 +293,7 @@ namespace mysqlx
     void send_bytes(const std::string &data);
 
     void set_trace_protocol(bool flag) { m_trace_packets = flag; }
+    unsigned long get_received_msg_counter(const std::string &id) const;
 
   private:
     void perform_close();
@@ -301,7 +301,7 @@ namespace mysqlx
     Message *recv_message_with_header(int &mid, char (&header_buffer)[5], const std::size_t header_offset);
     void throw_mysqlx_error(const Error &ec);
     ngs::shared_ptr<Result> new_result(bool expect_data);
-
+    void update_received_msg_counter(const Message* msg);
   private:
     std::list<Local_notice_handler> m_local_notice_handlers;
     Mysqlx::Connection::Capabilities m_capabilities;
@@ -313,6 +313,7 @@ namespace mysqlx
     const bool m_dont_wait_for_disconnect;
     const Internet_protocol m_ip_mode;
     ngs::shared_ptr<Result> m_last_result;
+    std::map<std::string, unsigned long> m_received_msg_counters;
   };
 
   bool parse_mysql_connstring(const std::string &connstring,

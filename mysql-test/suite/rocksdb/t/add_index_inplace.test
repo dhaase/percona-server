@@ -1,8 +1,4 @@
---source include/have_rocksdb_as_default.inc
-
---disable_warnings
-drop table if exists t1;
---enable_warnings
+--source include/have_rocksdb.inc
 
 ##
 ## test adding index inplace
@@ -170,7 +166,6 @@ DROP TABLE t1;
 # test failure in prepare phase (due to collation)
 CREATE TABLE t1 (a INT, b TEXT);
 
---error 1105
 ALTER TABLE t1 ADD KEY kb(b(10));
 ALTER TABLE t1 ADD PRIMARY KEY(a);
 DROP TABLE t1;
@@ -186,8 +181,8 @@ connect (con1,localhost,root,,);
 --echo # Switch to connection con1
 connection con1;
 
-show global variables like 'rocksdb_bulk_load';
-show session variables like 'rocksdb_bulk_load';
+show global variables like 'rocksdb_bulk_load%';
+show session variables like 'rocksdb_bulk_load%';
 
 CREATE TABLE t1 (i INT, j INT, PRIMARY KEY (i)) ENGINE = ROCKSDB;
 
@@ -255,9 +250,9 @@ SET @prior_rocksdb_merge_buf_size = @@rocksdb_merge_buf_size;
 
 SET global rocksdb_strict_collation_check = off;
 SET session rocksdb_merge_combine_read_size = 566;
-SET session rocksdb_merge_buf_size = 336;
+SET session rocksdb_merge_buf_size = 340;
 
-show variables like '%rocksdb_bulk_load%';
+show variables like 'rocksdb_bulk_load%';
 CREATE TABLE t1 (a VARCHAR(80)) ENGINE=RocksDB;
 INSERT INTO t1 (a) VALUES (REPEAT("a", 80));
 INSERT INTO t1 (a) VALUES (REPEAT("a", 80));
@@ -342,4 +337,65 @@ while ($i <= $max) {
 
 DROP TABLE t1;
 
+# https://github.com/facebook/mysql-5.6/issues/602
+# Add then drop same index should be optimized out.
+CREATE TABLE t1 (
+a INT PRIMARY KEY,
+b INT,
+c INT,
+KEY kbc(b,c)) ENGINE = ROCKSDB;
+INSERT INTO t1 (a,b,c) VALUES (1,1,1);
+INSERT INTO t1 (a,b,c) VALUES (2,2,2);
+INSERT INTO t1 (a,b,c) VALUES (3,3,3);
+SHOW CREATE TABLE t1;
 
+ALTER TABLE t1 DROP INDEX kbc, ADD INDEX kbc(b,c), ALGORITHM=INPLACE;
+ALTER TABLE t1 DROP INDEX kbc;
+DROP TABLE t1;
+
+# Make sure changing key part prefix length causes index rebuild as well.
+CREATE TABLE t1 (
+a INT PRIMARY KEY,
+b varchar(10),
+index kb(b(5))
+) ENGINE = ROCKSDB charset utf8 collate utf8_bin;
+
+INSERT INTO t1 (a,b) VALUES (1,'1111122222');
+INSERT INTO t1 (a,b) VALUES (2,'2222233333');
+INSERT INTO t1 (a,b) VALUES (3,'3333344444');
+
+--let $start_max_index_id = query_get_value(SELECT * from INFORMATION_SCHEMA.ROCKSDB_GLOBAL_INFO where type = 'MAX_INDEX_ID', VALUE, 1)
+
+ALTER TABLE t1 DROP INDEX kb, ADD INDEX kb(b(8)), ALGORITHM=INPLACE;
+SELECT * FROM t1 FORCE INDEX(kb);
+
+--let $end_max_index_id = query_get_value(SELECT * from INFORMATION_SCHEMA.ROCKSDB_GLOBAL_INFO where type = 'MAX_INDEX_ID', VALUE, 1)
+
+if ($end_max_index_id <= $start_max_index_id) {
+  echo Max index ID did not increase;
+}
+
+SHOW CREATE TABLE t1;
+DROP TABLE t1;
+
+# Cardinality checks for indexes statistics
+SET @prior_rocksdb_table_stats_sampling_pct = @@rocksdb_table_stats_sampling_pct;
+set global rocksdb_table_stats_sampling_pct = 100;
+
+CREATE TABLE t1 (a INT, b INT, PRIMARY KEY ka(a)) ENGINE=RocksDB;
+
+INSERT INTO t1 (a, b) VALUES (1, 10);
+INSERT INTO t1 (a, b) VALUES (2, 10);
+INSERT INTO t1 (a, b) VALUES (3, 20);
+INSERT INTO t1 (a, b) VALUES (4, 20);
+
+set global rocksdb_force_flush_memtable_now=1;
+analyze table t1;
+
+SHOW INDEX in t1;
+
+ALTER TABLE t1 ADD INDEX kb(b), ALGORITHM=INPLACE;
+SHOW INDEX in t1;
+
+DROP TABLE t1;
+SET global rocksdb_table_stats_sampling_pct = @prior_rocksdb_table_stats_sampling_pct;

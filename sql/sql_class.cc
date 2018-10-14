@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
    Copyright (c) 2016, Percona Inc. All Rights Reserved.
 
    This program is free software; you can redistribute it and/or modify
@@ -885,24 +885,31 @@ void thd_inc_row_count(THD *thd)
   thd->get_stmt_da()->inc_current_row_for_condition();
 }
 
-extern "C"
-void increment_thd_innodb_stats(THD* thd,
-                                unsigned long long trx_id,
-                                long io_reads,
-                                long long  io_read,
-                                long      io_reads_wait_timer,
-                                long      lock_que_wait_timer,
-                                long      que_wait_timer,
-                                long      page_access)
+extern "C" void thd_report_innodb_stat(THD *thd, unsigned long long trx_id,
+                                       enum mysql_trx_stat_type type,
+                                       unsigned long long       value)
 {
-  thd->innodb_was_used=               true;
-  thd->innodb_trx_id=                 trx_id;
-  thd->innodb_io_reads+=              io_reads;
-  thd->innodb_io_read+=               io_read;
-  thd->innodb_io_reads_wait_timer+=   io_reads_wait_timer;
-  thd->innodb_lock_que_wait_timer+=   lock_que_wait_timer;
-  thd->innodb_innodb_que_wait_timer+= que_wait_timer;
-  thd->innodb_page_access+=           page_access;
+  thd->mark_innodb_used(trx_id);
+  switch (type)
+  {
+    case MYSQL_TRX_STAT_IO_READ_BYTES:
+      DBUG_ASSERT(value > 0);
+      thd->innodb_io_read+= value;
+      thd->innodb_io_reads++;
+      break;
+    case MYSQL_TRX_STAT_IO_READ_WAIT_USECS:
+      thd->innodb_io_reads_wait_timer+= value;
+      break;
+    case MYSQL_TRX_STAT_LOCK_WAIT_USECS:
+      thd->innodb_lock_que_wait_timer+= value;
+      break;
+    case MYSQL_TRX_STAT_INNODB_QUEUE_WAIT_USECS:
+      thd->innodb_innodb_que_wait_timer+= value;
+      break;
+    case MYSQL_TRX_STAT_ACCESS_PAGE_ID:
+      thd->access_distinct_page(value);
+      break;
+  }
 }
 
 extern "C"
@@ -1046,6 +1053,19 @@ void thd_kill(ulong id)
 }
 
 /**
+   Check whether ft_query_extra_word_chars server variable is enabled for the
+   current session
+
+   @return ft_query_extra_word_chars value
+*/
+extern "C"
+int thd_get_ft_query_extra_word_chars(void)
+{
+  const THD* thd= current_thd;
+  return thd ? thd->variables.ft_query_extra_word_chars : 0;
+}
+
+/**
   Returns the partition_info working copy.
   Used to see if a table should be created with partitioning.
 
@@ -1140,6 +1160,7 @@ THD::THD(bool enable_plugins)
    fill_variables_recursion_level(0),
    order_deterministic(false),
    binlog_row_event_extra_data(NULL),
+   skip_readonly_check(false),
    binlog_unsafe_warning_flags(0),
    binlog_table_maps(0),
    binlog_accessed_db_names(NULL),
@@ -1268,6 +1289,7 @@ THD::THD(bool enable_plugins)
   peer_port= 0;					// For SHOW PROCESSLIST
   get_transaction()->m_flags.enabled= true;
   active_vio = 0;
+  m_SSL = NULL;
   mysql_mutex_init(key_LOCK_thd_data, &LOCK_thd_data, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(key_LOCK_thd_query, &LOCK_thd_query, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(key_LOCK_thd_sysvar, &LOCK_thd_sysvar, MY_MUTEX_INIT_FAST);
@@ -1679,6 +1701,8 @@ void THD::init(void)
   owned_sid.clear();
   owned_gtid.dbug_print(NULL, "set owned_gtid (clear) in THD::init");
 
+  rpl_thd_ctx.dependency_tracker_ctx().set_last_session_sequence_number(0);
+
   clear_slow_extended();
 }
 
@@ -1710,7 +1734,6 @@ void THD::reset_diff_stats(void)
   diff_lost_connections=           0;
   diff_access_denied_errors=       0;
   diff_empty_queries=              0;
-  diff_disconnects=                0;
 }
 
 // Updates 'diff' stats of a THD.
@@ -1976,17 +1999,6 @@ void THD::release_resources()
 
   Global_THD_manager::get_instance()->release_thread_id(m_thread_id);
 
-  mysql_mutex_lock(&LOCK_status);
-  add_to_status(&global_status_var, &status_var, false);
-  /*
-    Status queries after this point should not aggregate THD::status_var
-    since the values has been added to global_status_var.
-    The status values are not reset so that they can still be read
-    by performance schema.
-  */
-  status_var_aggregated= true;
-  mysql_mutex_unlock(&LOCK_status);
-
   /* Ensure that no one is using THD */
   mysql_mutex_lock(&LOCK_thd_data);
   mysql_mutex_lock(&LOCK_query_plan);
@@ -2042,6 +2054,18 @@ void THD::release_resources()
 
   if (current_thd == this)
     restore_globals();
+
+  mysql_mutex_lock(&LOCK_status);
+  add_to_status(&global_status_var, &status_var, false);
+  /*
+    Status queries after this point should not aggregate THD::status_var
+    since the values has been added to global_status_var.
+    The status values are not reset so that they can still be read
+    by performance schema.
+  */
+  status_var_aggregated= true;
+  mysql_mutex_unlock(&LOCK_status);
+
   m_release_resources_done= true;
 }
 
@@ -2224,7 +2248,10 @@ void THD::awake(THD::killed_state state_to_set)
     ha_kill_connection(this);
 
   if (state_to_set == THD::KILL_TIMEOUT)
+  {
+    DBUG_ASSERT(!status_var_aggregated);
     status_var.max_execution_time_exceeded++;
+  }
 
 
   /* Broadcast a condition to kick the target if it is waiting on it. */
@@ -2483,6 +2510,7 @@ void THD::cleanup_after_query()
   if (rli_slave)
     rli_slave->cleanup_after_query();
 #endif
+  approx_distinct_pages.clear();
 }
 
 LEX_CSTRING *
@@ -2713,7 +2741,7 @@ int THD::send_explain_fields(Query_result *result)
 enum_vio_type THD::get_vio_type()
 {
 #ifndef EMBEDDED_LIBRARY
-  DBUG_ENTER("shutdown_active_vio");
+  DBUG_ENTER("THD::get_vio_type");
   DBUG_RETURN(get_protocol()->connection_type());
 #else
   return NO_VIO_TYPE;
@@ -2729,6 +2757,7 @@ void THD::shutdown_active_vio()
   {
     vio_shutdown(active_vio, SHUT_RDWR);
     active_vio = 0;
+    m_SSL = NULL;
   }
 #endif
   DBUG_VOID_RETURN;
@@ -3909,6 +3938,7 @@ void thd_increment_bytes_sent(size_t length)
   THD *thd= current_thd;
   if (likely(thd != NULL))
   { /* current_thd==NULL when close_connection() calls net_send_error() */
+    DBUG_ASSERT(!thd->status_var_aggregated);
     thd->status_var.bytes_sent+= length;
     thd->bytes_sent+= length;
   }
@@ -3920,6 +3950,7 @@ void thd_increment_bytes_received(size_t length)
   THD *thd= current_thd;
   if (likely(thd != NULL))
   {
+    DBUG_ASSERT(!thd->status_var_aggregated);
     thd->status_var.bytes_received+= length;
     thd->bytes_received+= length;
   }
@@ -4018,6 +4049,16 @@ extern "C" void thd_set_kill_status(const MYSQL_THD thd)
 extern "C" unsigned long thd_get_thread_id(const MYSQL_THD thd)
 {
   return((unsigned long)thd->thread_id());
+}
+
+/**
+  Return the query id of a thread
+  @param thd user thread
+  @return query id
+*/
+extern "C" int64_t thd_get_query_id(const MYSQL_THD thd)
+{
+  return(thd->query_id);
 }
 
 /**
@@ -4340,6 +4381,13 @@ void THD::reset_sub_statement_state(Sub_statement_state *backup,
   cuted_fields= 0;
   get_transaction()->m_savepoints= 0;
   first_successful_insert_id_in_cur_stmt= 0;
+
+  /* Reset savepoint on transaction write set */
+  if (is_current_stmt_binlog_row_enabled_with_write_set_extraction())
+  {
+      get_transaction()->get_transaction_write_set_ctx()
+          ->reset_savepoint_list();
+  }
 }
 
 void THD::clear_slow_extended()
@@ -4359,6 +4407,7 @@ void THD::clear_slow_extended()
   innodb_io_reads_wait_timer=   0;
   innodb_lock_que_wait_timer=   0;
   innodb_innodb_que_wait_timer= 0;
+  approx_distinct_pages.clear();
   innodb_page_access=           0;
   query_plan_flags=             QPLAN_NONE;
   query_plan_fsort_passes=      0;
@@ -4469,6 +4518,14 @@ void THD::restore_sub_statement_state(Sub_statement_state *backup)
   */
   inc_examined_row_count(backup->examined_row_count);
   cuted_fields+=       backup->cuted_fields;
+
+  /* Restore savepoint on transaction write set */
+  if (is_current_stmt_binlog_row_enabled_with_write_set_extraction())
+  {
+      get_transaction()->get_transaction_write_set_ctx()
+          ->restore_savepoint_list();
+  }
+
   restore_sub_statement_state_slow_extended(backup);
   DBUG_VOID_RETURN;
 }
@@ -4499,6 +4556,7 @@ void THD::inc_examined_row_count(ha_rows count)
 
 void THD::inc_status_created_tmp_disk_tables()
 {
+  DBUG_ASSERT(!status_var_aggregated);
   status_var.created_tmp_disk_tables++;
   query_plan_flags|= QPLAN_TMP_DISK;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
@@ -4508,6 +4566,7 @@ void THD::inc_status_created_tmp_disk_tables()
 
 void THD::inc_status_created_tmp_tables()
 {
+  DBUG_ASSERT(!status_var_aggregated);
   status_var.created_tmp_tables++;
   query_plan_flags|= QPLAN_TMP_TABLE;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
@@ -4517,6 +4576,7 @@ void THD::inc_status_created_tmp_tables()
 
 void THD::inc_status_select_full_join()
 {
+  DBUG_ASSERT(!status_var_aggregated);
   status_var.select_full_join_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_select_full_join)(m_statement_psi, 1);
@@ -4526,6 +4586,7 @@ void THD::inc_status_select_full_join()
 
 void THD::inc_status_select_full_range_join()
 {
+  DBUG_ASSERT(!status_var_aggregated);
   status_var.select_full_range_join_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_select_full_range_join)(m_statement_psi, 1);
@@ -4534,6 +4595,7 @@ void THD::inc_status_select_full_range_join()
 
 void THD::inc_status_select_range()
 {
+  DBUG_ASSERT(!status_var_aggregated);
   status_var.select_range_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_select_range)(m_statement_psi, 1);
@@ -4542,6 +4604,7 @@ void THD::inc_status_select_range()
 
 void THD::inc_status_select_range_check()
 {
+  DBUG_ASSERT(!status_var_aggregated);
   status_var.select_range_check_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_select_range_check)(m_statement_psi, 1);
@@ -4550,6 +4613,7 @@ void THD::inc_status_select_range_check()
 
 void THD::inc_status_select_scan()
 {
+  DBUG_ASSERT(!status_var_aggregated);
   status_var.select_scan_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_select_scan)(m_statement_psi, 1);
@@ -4559,6 +4623,7 @@ void THD::inc_status_select_scan()
 
 void THD::inc_status_sort_merge_passes()
 {
+  DBUG_ASSERT(!status_var_aggregated);
   status_var.filesort_merge_passes++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_sort_merge_passes)(m_statement_psi, 1);
@@ -4567,6 +4632,7 @@ void THD::inc_status_sort_merge_passes()
 
 void THD::inc_status_sort_range()
 {
+  DBUG_ASSERT(!status_var_aggregated);
   status_var.filesort_range_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_sort_range)(m_statement_psi, 1);
@@ -4575,6 +4641,7 @@ void THD::inc_status_sort_range()
 
 void THD::inc_status_sort_rows(ha_rows count)
 {
+  DBUG_ASSERT(!status_var_aggregated);
   status_var.filesort_rows+= count;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_sort_rows)(m_statement_psi,
@@ -4584,6 +4651,7 @@ void THD::inc_status_sort_rows(ha_rows count)
 
 void THD::inc_status_sort_scan()
 {
+  DBUG_ASSERT(!status_var_aggregated);
   status_var.filesort_scan_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_sort_scan)(m_statement_psi, 1);
@@ -5064,6 +5132,18 @@ void THD::rpl_detach_engine_ha_data()
 #endif
 };
 
+void THD::rpl_reattach_engine_ha_data()
+{
+#ifdef HAVE_REPLICATION
+  Relay_log_info *rli =
+      is_binlog_applier() ? rli_fake : (slave_thread ? rli_slave : NULL);
+
+  DBUG_ASSERT(!rli_fake || !rli_fake->is_engine_ha_data_detached);
+  DBUG_ASSERT(!rli_slave || !rli_slave->is_engine_ha_data_detached);
+
+  if (rli) rli->reattach_engine_ha_data(this);
+#endif
+}
 
 bool THD::rpl_unflag_detached_engine_ha_data()
 {
@@ -5087,4 +5167,11 @@ bool THD::is_current_stmt_binlog_disabled() const
 {
   return (!(variables.option_bits & OPTION_BIN_LOG) ||
           !mysql_bin_log.is_open());
+}
+
+bool THD::is_current_stmt_binlog_row_enabled_with_write_set_extraction() const
+{
+  return ((variables.transaction_write_set_extraction != HASH_ALGORITHM_OFF) &&
+          is_current_stmt_binlog_format_row() &&
+          !is_current_stmt_binlog_disabled());
 }

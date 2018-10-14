@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2017, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -252,7 +252,7 @@ struct fil_node_t {
 	/** whether this file is open */
 	bool		is_open;
 	/** file handle (valid if is_open) */
-	os_file_t	handle;
+	pfs_os_file_t	handle;
 	/** event that groups and serializes calls to fsync */
 	os_event_t	sync_event;
 	/** whether the file actually is a raw device or disk partition */
@@ -955,14 +955,18 @@ dberr_t
 fil_prepare_for_truncate(
 /*=====================*/
 	ulint	id);			/*!< in: space id */
-/**********************************************************************//**
-Reinitialize the original tablespace header with the same space id
-for single tablespace */
+
+/** Reinitialize the original tablespace header with the same space id
+for single tablespace
+@param[in]	table		table belongs to the tablespace
+@param[in]	size            size in blocks
+@param[in]	trx		Transaction covering truncate */
 void
-fil_reinit_space_header(
-/*====================*/
-	ulint		id,	/*!< in: space id */
-	ulint		size);	/*!< in: size in blocks */
+fil_reinit_space_header_for_table(
+	dict_table_t*	table,
+	ulint		size,
+	trx_t*		trx);
+
 /*******************************************************************//**
 Closes a single-table tablespace. The tablespace must be cached in the
 memory cache. Free all pages used by the tablespace.
@@ -1212,6 +1216,8 @@ fil_space_get_n_reserved_extents(
 				aligned
 @param[in]	message		message for aio handler if non-sync aio
 				used, else ignored
+@param[in]	should_buffer	whether to buffer an aio request.
+				Only used by aio read ahead
 
 @return DB_SUCCESS, DB_TABLESPACE_DELETED or DB_TABLESPACE_TRUNCATED
 if we are trying to do i/o on a tablespace which does not exist */
@@ -1225,10 +1231,13 @@ _fil_io(
 	ulint			len,
 	void*			buf,
 	void*			message,
-	trx_t*			trx);
+	trx_t*			trx,
+	bool			should_buffer);
 
-#define fil_io(type, sync, page_id, page_size, byte_offset, len, buf, message) \
-	_fil_io(type, sync, page_id, page_size, byte_offset, len, buf, message, NULL)
+#define fil_io(type, sync, page_id, page_size, byte_offset, \
+		len, buf, message) \
+	_fil_io(type, sync, page_id, page_size, byte_offset, \
+		len, buf, message, NULL, false)
 
 /**********************************************************************//**
 Waits for an aio operation to complete. This function is used to write the
@@ -1404,14 +1413,14 @@ struct PageCallback {
 	@param block block read from file, note it is not from the buffer pool
 	@retval DB_SUCCESS or error code. */
 	virtual dberr_t operator()(
-		os_offset_t 	offset,
+		os_offset_t	offset,
 		buf_block_t*	block) UNIV_NOTHROW = 0;
 
 	/** Set the name of the physical file and the file handle that is used
 	to open it for the file that is being iterated over.
 	@param filename then physical name of the tablespace file.
 	@param file OS file handle */
-	void set_file(const char* filename, os_file_t file) UNIV_NOTHROW
+	void set_file(const char* filename, pfs_os_file_t file) UNIV_NOTHROW
 	{
 		m_file = file;
 		m_filepath = filename;
@@ -1440,7 +1449,7 @@ struct PageCallback {
 	page_size_t		m_page_size;
 
 	/** File handle to the tablespace */
-	os_file_t		m_file;
+	pfs_os_file_t		m_file;
 
 	/** Physical file path. */
 	const char*		m_filepath;
@@ -1651,13 +1660,21 @@ fil_names_clear(
 	lsn_t	lsn,
 	bool	do_write);
 
+/** Enable encryption of temporary tablespace
+@param[in,out]	space	tablespace object
+@return DB_SUCCESS on success, DB_ERROR on failure */
+MY_NODISCARD
+dberr_t
+fil_temp_update_encryption(
+	fil_space_t*	space);
+
 #if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
 /**
 Try and enable FusionIO atomic writes.
 @param[in] file		OS file handle
 @return true if successful */
 bool
-fil_fusionio_enable_atomic_write(os_file_t file);
+fil_fusionio_enable_atomic_write(pfs_os_file_t file);
 #endif /* !NO_FALLOCATE && UNIV_LINUX */
 
 /** Note that the file system where the file resides doesn't support PUNCH HOLE
@@ -1689,4 +1706,12 @@ fil_space_set_corrupt(
 /*==================*/
 	ulint	space_id);
 
+typedef std::vector<ulint> space_id_vec;
+
+/** Rotate tablespace keys of global tablespaces like system, temporary, etc.
+This is used only at startup to fix the empty UUIDs.
+@param[in]	space_ids	vector of space_ids
+@return true on success, false on failure */
+bool
+fil_encryption_rotate_global(const space_id_vec& space_ids);
 #endif /* fil0fil_h */

@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2000, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2000, 2017, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -409,6 +409,18 @@ row_create_update_node_for_mysql(
 /*=============================*/
 	dict_table_t*	table,	/*!< in: table to update */
 	mem_heap_t*	heap);	/*!< in: mem heap from which allocated */
+
+/**********************************************************************//**
+Does a cascaded delete or set null in a foreign key operation.
+@return error code or DB_SUCCESS */
+dberr_t
+row_update_cascade_for_mysql(
+/*=========================*/
+        que_thr_t*      thr,    /*!< in: query thread */
+        upd_node_t*     node,   /*!< in: update node used in the cascade
+                                or set null operation */
+        dict_table_t*   table)  /*!< in: table where we do the operation */
+        MY_ATTRIBUTE((nonnull, warn_unused_result));
 /*********************************************************************//**
 Locks the data dictionary exclusively for performing a table create or other
 data dictionary modification operation. */
@@ -621,6 +633,7 @@ row_rename_table_for_mysql(
 @return error code or DB_SUCCESS */
 dberr_t
 row_rename_partitions_for_mysql(
+	THD*		thd,
 	const char*	old_name,
 	const char*	new_name,
 	trx_t*		trx)
@@ -638,9 +651,11 @@ row_scan_index_for_mysql(
 	row_prebuilt_t*		prebuilt,	/*!< in: prebuilt struct
 						in MySQL handle */
 	const dict_index_t*	index,		/*!< in: index */
+#ifdef WL6742
 	bool			check_keys,	/*!< in: true=check for mis-
 						ordered or duplicate records,
 						false=count the rows only */
+#endif
 	ulint*			n_rows)		/*!< out: number of entries
 						seen in the consistent read */
 	MY_ATTRIBUTE((warn_unused_result));
@@ -678,6 +693,12 @@ struct mysql_row_templ_t {
 					Innobase record in the current index;
 					not defined if template_type is
 					ROW_MYSQL_WHOLE_ROW */
+	bool	rec_field_is_prefix;	/* is this field in a prefix index? */
+	ulint	rec_prefix_field_no;	/* record field, even if just a
+					prefix; same as rec_field_no when not a
+					prefix, otherwise rec_field_no is
+					ULINT_UNDEFINED but this is the true
+					field number*/
 	ulint	clust_rec_field_no;	/*!< field number of the column in an
 					Innobase record in the clustered index;
 					not defined if template_type is
@@ -726,6 +747,8 @@ struct mysql_row_templ_t {
 
 #define ROW_PREBUILT_ALLOCATED	78540783
 #define ROW_PREBUILT_FREED	26423527
+
+class ha_innobase;
 
 /** A struct for (sometimes lazily) prebuilt structures in an Innobase table
 handle used within MySQL; these are used to save CPU time. */
@@ -778,7 +801,9 @@ struct row_prebuilt_t {
 					columns through a secondary index
 					and at least one column is not in
 					the secondary index, then this is
-					set to TRUE */
+					set to TRUE; note that sometimes this
+					is set but we later optimize out the
+					clustered index lookup */
 	unsigned	templ_contains_blob:1;/*!< TRUE if the template contains
 					a column with DATA_LARGE_MTYPE(
 					get_innobase_type_from_mysql_type())
@@ -799,6 +824,8 @@ struct row_prebuilt_t {
 	mem_heap_t*	heap;		/*!< memory heap from which
 					these auxiliary structures are
 					allocated when needed */
+	mem_heap_t*     cursor_heap;	/*!< memory heap from which
+					innodb_api_buf is allocated per session */
 	ins_node_t*	ins_node;	/*!< Innobase SQL insert node
 					used to perform inserts
 					to the table */
@@ -950,6 +977,9 @@ struct row_prebuilt_t {
 	unsigned	innodb_api:1;	/*!< whether this is a InnoDB API
 					query */
 	const rec_t*	innodb_api_rec;	/*!< InnoDB API search result */
+	void*           innodb_api_buf; /*!< Buffer holding copy of the physical
+					Innodb API search record */
+	ulint           innodb_api_rec_size; /*!< Size of the Innodb API record */
 	/*----------------------*/
 
 	/*----------------------*/
@@ -979,8 +1009,14 @@ struct row_prebuilt_t {
 	/** The MySQL table object */
 	TABLE*		m_mysql_table;
 
+	/** The MySQL handler object. */
+	ha_innobase*	m_mysql_handler;
+
 	/** limit value to avoid fts result overflow */
 	ulonglong	m_fts_limit;
+
+	/** True if exceeded the end_range while filling the prefetch cache. */
+	bool		m_end_range;
 };
 
 /** Callback for row_mysql_sys_index_iterate() */

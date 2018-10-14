@@ -164,30 +164,6 @@ SHOW SESSION STATUS LIKE 'Last_query_cost';
 Variable_name	Value
 Last_query_cost	5.205912
 DROP TABLE t1;
-show status like 'com_show_status';
-Variable_name	Value
-Com_show_status	3
-show status like 'hand%write%';
-Variable_name	Value
-Handler_write	0
-show status like '%tmp%';
-Variable_name	Value
-Created_tmp_disk_tables	0
-Created_tmp_files	0
-Created_tmp_tables	0
-show status like 'hand%write%';
-Variable_name	Value
-Handler_write	0
-show status like '%tmp%';
-Variable_name	Value
-Created_tmp_disk_tables	0
-Created_tmp_files	0
-Created_tmp_tables	0
-show status like 'com_show_status';
-Variable_name	Value
-Com_show_status	8
-rnd_diff	tmp_table_diff
-20	8
 flush status;
 show status like 'Com%function';
 Variable_name	Value
@@ -235,11 +211,6 @@ drop procedure proc37908;
 drop function func37908;
 REVOKE ALL PRIVILEGES, GRANT OPTION FROM mysqltest_1@localhost;
 DROP USER mysqltest_1@localhost;
-SET @old2_log_output = @@GLOBAL.log_output;
-SET GLOBAL log_output = 'TABLE';
-SET @old_general_log = @@GLOBAL.general_log;
-SET GLOBAL general_log = 'ON';
-TRUNCATE TABLE mysql.general_log;
 DROP PROCEDURE IF EXISTS p1;
 DROP FUNCTION IF EXISTS f1;
 CREATE FUNCTION f1() RETURNS INTEGER
@@ -260,13 +231,8 @@ f1()
 CALL p1();
 1
 1
-SELECT 9;
-9
-9
 DROP PROCEDURE p1;
 DROP FUNCTION f1;
-SET GLOBAL log_output = @old2_log_output;
-SET GLOBAL general_log = @old_general_log;
 #
 # Test coverage for status variables which were introduced by
 # WL#5772 "Add partitioned Table Definition Cache to avoid

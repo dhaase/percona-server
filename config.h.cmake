@@ -1,4 +1,4 @@
-/* Copyright (c) 2009, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2009, 2018, Oracle and/or its affiliates. All rights reserved.
  
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -30,10 +30,12 @@
 #cmakedefine HAVE_LIBDL 1
 #cmakedefine HAVE_LIBRT 1
 #cmakedefine HAVE_LIBWRAP 1
+#cmakedefine HAVE_LIBWRAP_PROTOTYPES 1
 
 /* Header files */
 #cmakedefine HAVE_ALLOCA_H 1
 #cmakedefine HAVE_ARPA_INET_H 1
+#cmakedefine HAVE_CRYPT_H 1
 #cmakedefine HAVE_DLFCN_H 1
 #cmakedefine HAVE_EXECINFO_H 1
 #cmakedefine HAVE_FPU_CONTROL_H 1
@@ -133,6 +135,7 @@
 #cmakedefine HAVE_MEMALIGN 1
 #cmakedefine HAVE_NL_LANGINFO 1
 #cmakedefine HAVE_HTONLL 1
+#cmakedefine HAVE_MEMSET_S 1
 #cmakedefine DNS_USE_CPU_CLOCK_FOR_ID 1
 #cmakedefine HAVE_EPOLL 1
 /* #cmakedefine HAVE_EVENT_PORTS 1 */
@@ -197,6 +200,7 @@
 #cmakedefine HAVE_GCC_ATOMIC_BUILTINS 1
 #cmakedefine HAVE_GCC_SYNC_BUILTINS 1
 #cmakedefine HAVE_VALGRIND
+#cmakedefine HAVE_PTHREAD_THREADID_NP 1
 
 /* IPV6 */
 #cmakedefine HAVE_NETINET_IN6_H 1
@@ -273,8 +277,7 @@
 #cmakedefine HAVE_NCURSES_H 1
 #cmakedefine USE_LIBEDIT_INTERFACE 1
 #cmakedefine HAVE_HIST_ENTRY 1
-#cmakedefine USE_NEW_EDITLINE_INTERFACE 1
-#cmakedefine USE_NEW_READLINE_INTERFACE 1
+#cmakedefine USE_NEW_XLINE_INTERFACE 1
 #cmakedefine HAVE_READLINE_HISTORY_H 1
 
 /*
@@ -333,6 +336,8 @@
 #cmakedefine HAVE_CHARSET_utf16 1
 #cmakedefine HAVE_CHARSET_utf32 1
 #cmakedefine HAVE_UCA_COLLATIONS 1
+#cmakedefine HAVE_X509_CHECK_HOST 1
+#cmakedefine HAVE_X509_CHECK_IP 1
 
 /*
  * Feature set

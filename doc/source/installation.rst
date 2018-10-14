@@ -12,6 +12,7 @@ This page provides the information on how to you can install |Percona Server|. F
 * :ref:`installing_from_source_tarball`
 * :ref:`source_from_git`
 * :ref:`compile_from_source`
+* :ref:`docker`
 
 Before installing, you might want to read the :doc:`release-notes/release-notes_index`.
 
@@ -20,7 +21,7 @@ Before installing, you might want to read the :doc:`release-notes/release-notes_
 Installing |Percona Server| from Repositories
 =============================================
 
-|Percona| provides repositories for :program:`yum` (``RPM`` packages for *Red Hat*, *CentOS* and *Amazon Linux AMI*) and :program:`apt` (:file:`.deb` packages for *Ubuntu* and *Debian*) for software such as |Percona Server|, |Percona XtraBackup|, and *Percona Toolkit*. This makes it easy to install and update your software and its dependencies through your operating system's package manager. This is the recommend way of installing where possible.
+|Percona| provides repositories for :program:`yum` (``RPM`` packages for *Red Hat*, *CentOS* and *Amazon Linux AMI*) and :program:`apt` (:file:`.deb` packages for *Ubuntu* and *Debian*) for software such as |Percona Server|, |Percona XtraBackup|, and *Percona Toolkit*. This makes it easy to install and update your software and its dependencies through your operating system's package manager. This is the recommended way of installing where possible.
 
 Following guides describe the installation process for using the official Percona repositories for :file:`.deb` and :file:`.rpm` packages.
 
@@ -38,8 +39,9 @@ Installing |Percona Server| from a Binary Tarball
 
 |Percona Server| offers multiple tarballs depending on the *OpenSSL* library available in the distribution:
 
- * ssl100 - for all *Debian/Ubuntu* versions (``libssl.so.1.0.0 => /usr/lib/x86_64-linux-gnu/libssl.so.1.0.0 (0x00007f2e389a5000)``);
+ * ssl100 - for *Debian* prior to 9 and *Ubuntu* prior to 14.04 versions (``libssl.so.1.0.0 => /usr/lib/x86_64-linux-gnu/libssl.so.1.0.0 (0x00007f2e389a5000)``);
  * ssl101 - for *CentOS* 6 and *CentOS* 7 (``libssl.so.10 => /usr/lib64/libssl.so.10 (0x00007facbe8c4000)``);
+ * ssl102 - for *Debian* 9 and *Ubuntu* versions starting from 14.04 (``libssl.so.1.1 => /usr/lib/libssl.so.1.1 (0x00007f5e57397000)``;
 
 You can download the binary tarballs from the ``Linux - Generic`` `section <https://www.percona.com/downloads/Percona-Server-5.7/LATEST/binary/tarball/>`_ on the download page.
 
@@ -47,7 +49,7 @@ Fetch and extract the correct binary tarball. For example for *Debian Wheezy*:
 
 .. code-block:: bash
 
-  $ wget https://www.percona.com/downloads/Percona-Server-5.7/Percona-Server-5.7.10-3/binary/tarball/Percona-Server-5.7.10-3-Linux.x86_64.ssl100.tar.gz
+  $ wget https://www.percona.com/downloads/Percona-Server-LATEST/Percona-Server-5.7.18-14/binary/tarball/Percona-Server-5.7.18-14-Linux.x86_64.ssl100.tar.gz
 
 
 .. _installing_from_source_tarball:
@@ -57,8 +59,8 @@ Installing |Percona Server| from a Source Tarball
 
 Fetch and extract the source tarball. For example: ::
 
-  $ wget https://www.percona.com/downloads/Percona-Server-5.7/Percona-Server-5.7.10-3/source/tarball/percona-server-5.7.10-3.tar.gz
-  $ tar xfz Percona-Server-5.7.10-3-Linux.x86_64.ssl100.tar.gz
+  $ wget https://www.percona.com/downloads/Percona-Server-LATEST/Percona-Server-5.7.18-14/source/tarball/percona-server-5.7.18-14.tar.gz
+  $ tar xfz percona-server-5.7.18-14.tar.gz
 
 Next, follow the instructions in :ref:`compile_from_source` below.
 
@@ -156,3 +158,9 @@ packages for all Debian and Ubuntu releases.
 .. note::
 
   :ref:`pam_plugin` is not built with the server by default. In order to build the Percona Server with PAM plugin, additional option :option:`-DWITH_PAM=ON` should be used.
+
+.. toctree::
+   :hidden:
+
+   installation/docker
+

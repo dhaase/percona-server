@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -48,10 +48,14 @@
 #include <pfs_statement_provider.h>
 #include <mysql/psi/mysql_statement.h>
 
+#include <bitset>
 #include <memory>
 #include "mysql/thread_type.h"
 
+#include "violite.h"                       /* SSL_handle */
+
 #include "query_strip_comments.h"
+#include "sql_thd_internal_api.h"
 
 class Reprepare_observer;
 class sp_cache;
@@ -523,6 +527,7 @@ typedef struct system_variables
   ulong completion_type;
   ulong query_cache_type;
   ulong tx_isolation;
+  ulong transaction_isolation;
   ulong updatable_views_with_limit;
   uint max_user_connections;
   ulong my_aes_mode;
@@ -538,6 +543,7 @@ typedef struct system_variables
     Default transaction access mode. READ ONLY (true) or READ WRITE (false).
   */
   my_bool tx_read_only;
+  my_bool transaction_read_only;
   my_bool low_priority_updates;
   my_bool new_mode;
   my_bool query_cache_wlock_invalidate;
@@ -583,7 +589,6 @@ typedef struct system_variables
 #ifndef DBUG_OFF
   ulonglong query_exec_time;
   double    query_exec_time_double;
-  ulong     query_exec_id;
 #endif
   ulong log_slow_rate_limit;
   ulonglong log_slow_filter;
@@ -615,11 +620,18 @@ typedef struct system_variables
   ulong threadpool_high_prio_mode;
   ulong   session_track_transaction_info;
   /**
+    Used for the verbosity of SHOW CREATE TABLE. Currently used for displaying
+    the row format in the output even if the table uses default row format.
+  */
+  my_bool show_create_table_verbosity;
+  /**
     Compatibility option to mark the pre MySQL-5.6.4 temporals columns using
     the old format using comments for SHOW CREATE TABLE and in I_S.COLUMNS
     'COLUMN_TYPE' field.
   */
   my_bool show_old_temporals;
+
+  my_bool ft_query_extra_word_chars;
 } SV;
 
 
@@ -702,6 +714,8 @@ typedef struct system_status_var
   double last_query_cost;
   ulonglong last_query_partial_plans;
 
+  /** fragmentation statistics */
+  fragmentation_stats_t fragmentation_stats;
 } STATUS_VAR;
 
 /*
@@ -786,6 +800,19 @@ public:
     STMT_CONVENTIONAL_EXECUTION= 3, STMT_EXECUTED= 4, STMT_ERROR= -1
   };
 
+  /*
+    State and state changes in SP:
+    1) When state is STMT_INITIALIZED_FOR_SP, objects in the item tree are
+       created on the statement memroot. This is enforced through
+       ps_arena_holder checking the state.
+    2) After the first execute (call p1()), this state should change to
+       STMT_EXECUTED. Objects will be created on the execution memroot and will
+       be destroyed at the end of each execution.
+    3) In case an ER_NEED_REPREPARE error occurs, state should be changed to
+       STMT_INITIALIZED_FOR_SP and objects will again be created on the
+       statement memroot. At the end of this execution, state should change to
+       STMT_EXECUTED.
+  */
   enum_state state;
 
   Query_arena(MEM_ROOT *mem_root_arg, enum enum_state state_arg) :
@@ -1244,6 +1271,14 @@ public:
   }
 };
 
+class Key_length_error_handler : public Internal_error_handler {
+ public:
+  virtual bool handle_condition(THD *, uint sql_errno, const char *,
+                                Sql_condition::enum_severity_level *,
+                                const char *) {
+    return (sql_errno == ER_TOO_LONG_KEY);
+  }
+};
 
 /**
   This class is an internal error handler implementation for
@@ -1541,6 +1576,70 @@ typedef struct
 } QUERY_START_TIME_INFO;
 
 /**
+   A single-hash-function bloom filter for approximate accessed page
+   counter.
+*/
+class Bloom_filter {
+ private:
+  /** Bloom filter size, and a prime number for the calculation below */
+  enum { SIZE= 8191 };
+
+  typedef std::bitset<SIZE> Bit_set;
+
+  /** The bit set, which is allocated in a MEM_ROOT */
+  Bit_set *bit_set;
+
+  // Non-copyable
+  Bloom_filter (const Bloom_filter &);
+  Bloom_filter & operator = (const Bloom_filter &);
+
+ public:
+  Bloom_filter() : bit_set(NULL) {}
+
+  ~Bloom_filter()
+  {
+    // Do not delete, just destruct, due to MEM_ROOT allocation
+    bit_set->~bitset();
+  }
+
+  void clear()
+  {
+    // Do not delete, just force new MEM_ROOT allocation on the next use
+    bit_set= NULL;
+  }
+
+  /**
+     Check whether key is maybe a member of a set
+
+     @param[in, out]    mem_root        MEM_ROOT to allocate the bit set in, if
+      not allocated already
+     @param[in]         key             key whose presence to check
+
+     @return if true, the key might be a member of the set. If false, the key
+     is definitely not a member of the set.
+  */
+  bool test_and_set(MEM_ROOT *mem_root, ulong key)
+  {
+    if (!bit_set)
+    {
+      void *bit_set_place= alloc_root(mem_root, sizeof(Bit_set));
+      // FIXME: memory allocation failure is eaten silently. Nonexact stats are
+      // the least of the concerns then.
+      if (!bit_set_place)
+        return false;
+      bit_set= new (bit_set_place) Bit_set();
+    }
+    // Duplicating ut_hash_ulint calculation
+    const ulong pos= (key ^ 1653893711) % SIZE;
+    DBUG_ASSERT(pos < SIZE);
+    if (bit_set->test(pos))
+      return false;
+    bit_set->set(pos);
+    return true;
+  }
+};
+
+/**
   @class THD
   For each client connection we create a separate thread with THD serving as
   a thread/connection descriptor
@@ -1665,6 +1764,12 @@ public:
   void rpl_detach_engine_ha_data();
 
   /**
+    When the thread is a binlog or slave applier it reattaches the engine
+    ha_data associated with it and memorizes the fact of that.
+  */
+  void rpl_reattach_engine_ha_data();
+
+  /**
     @return true   when the current binlog (rli_fake) or slave (rli_slave)
                    applier thread has detached the engine ha_data,
                    see @c rpl_detach_engine_ha_data.
@@ -1755,6 +1860,7 @@ public:
   */
   void save_current_query_costs()
   {
+    DBUG_ASSERT(!status_var_aggregated);
     status_var.last_query_cost= m_current_query_cost;
     status_var.last_query_partial_plans= m_current_query_partial_plans;
   }
@@ -1866,6 +1972,22 @@ public:
     return m_protocol;
   }
 
+  SSL_handle get_ssl() const
+  {
+#ifndef DBUG_OFF
+    if (current_thd != this)
+    {
+      /*
+        When inspecting this thread from monitoring,
+        the monitoring thread MUST lock LOCK_thd_data,
+        to be allowed to safely inspect SSL status variables.
+      */
+      mysql_mutex_assert_owner(&LOCK_thd_data);
+    }
+#endif
+    return m_SSL;
+  }
+
   /**
     Asserts that the protocol is of type text or binary and then
     returns the m_protocol casted to Protocol_classic. This method
@@ -1886,6 +2008,17 @@ public:
 
 private:
   Protocol *m_protocol;           // Current protocol
+  /**
+    SSL data attached to this connection.
+    This is an opaque pointer,
+    When building with SSL, this pointer is non NULL
+    only if the connection is using SSL.
+    When building without SSL, this pointer is always NULL.
+    The SSL data can be inspected to read per thread
+    status variables,
+    and this can be inspected while the thread is running.
+  */
+  SSL_handle m_SSL;
 
 public:
   /**
@@ -2070,10 +2203,6 @@ public:
   ulong      tmp_tables_disk_used;
   ulonglong  tmp_tables_size;
   /*
-    Variable innodb_was_used shows used or not InnoDB engine in current query.
-  */
-  bool       innodb_was_used;
-  /*
     Following Variables innodb_*** (is |should be) different from
     default values only if (innodb_was_used==true)
   */
@@ -2083,7 +2212,40 @@ public:
   ulong      innodb_io_reads_wait_timer;
   ulong      innodb_lock_que_wait_timer;
   ulong      innodb_innodb_que_wait_timer;
+
+ private:
+  /*
+    Variable innodb_was_used shows used or not InnoDB engine in current query.
+  */
+  bool         innodb_was_used;
+  Bloom_filter approx_distinct_pages;
+
+ public:
   ulong      innodb_page_access;
+
+  void mark_innodb_used(ulonglong trx_id)
+  {
+    DBUG_ASSERT(innodb_trx_id == 0 || innodb_trx_id == trx_id);
+    innodb_trx_id= trx_id;
+    innodb_was_used= true;
+  }
+
+  void access_distinct_page(ulong page_id)
+  {
+    if (approx_distinct_pages.test_and_set(&main_mem_root, page_id))
+      innodb_page_access++;
+  }
+
+  bool innodb_slow_log_enabled() const
+  {
+    return variables.log_slow_verbosity & (1ULL << SLOG_V_INNODB);
+  }
+
+  bool innodb_slow_log_data_logged() const
+  {
+    DBUG_ASSERT(!innodb_was_used || innodb_slow_log_enabled());
+    return innodb_was_used;
+  }
 
   /*
     Variable query_plan_flags collects information about query plan entites
@@ -2219,6 +2381,14 @@ public:
 
   bool is_current_stmt_binlog_disabled() const;
 
+  /**
+    Determine if binloging is enabled in row format and write set extraction is
+    enabled for this session
+    @retval true  if is enable
+    @retval false otherwise
+  */
+  bool is_current_stmt_binlog_row_enabled_with_write_set_extraction() const;
+
   /** Tells whether the given optimizer_switch flag is on */
   inline bool optimizer_switch_flag(ulonglong flag) const
   {
@@ -2263,6 +2433,11 @@ public:
   struct st_thd_timer_info *timer_cache;
 
 private:
+  /*
+    Indicates that the command which is under execution should ignore the
+    'read_only' and 'super_read_only' options.
+  */
+  bool skip_readonly_check;
   /**
     Indicate if the current statement should be discarded
     instead of written to the binlog.
@@ -2325,6 +2500,22 @@ private:
   NET     net;                          // client connection descriptor
   String  packet;                       // dynamic buffer for network I/O
 public:
+  void set_skip_readonly_check()
+  {
+    skip_readonly_check= true;
+  }
+
+  bool is_cmd_skip_readonly()
+  {
+    return skip_readonly_check;
+  }
+
+  void reset_skip_readonly_check()
+  {
+    if (skip_readonly_check)
+      skip_readonly_check= false;
+  }
+
   void issue_unsafe_warnings();
 
   uint get_binlog_table_maps() const {
@@ -3131,7 +3322,6 @@ public:
   ulonglong diff_access_denied_errors;
   // Number of queries that return 0 rows
   ulonglong diff_empty_queries;
-  ulonglong diff_disconnects;
 
   // Per account query delay in miliseconds. When not 0, sleep this number of
   // milliseconds before every SQL command.
@@ -3190,7 +3380,7 @@ public:
     This list is later iterated to invoke release_thd() on those
     plugins.
   */
-  Prealloced_array<plugin_ref, 2> audit_class_plugins;
+  Plugin_array audit_class_plugins;
   /**
     Array of bits indicating which audit classes have already been
     added to the list of audit plugins which are currently in use.
@@ -3259,10 +3449,22 @@ public:
     mysql_mutex_unlock(&LOCK_thd_data);
   }
 
+  inline void set_ssl(Vio* vio)
+  {
+#ifdef HAVE_OPENSSL
+    mysql_mutex_lock(&LOCK_thd_data);
+    m_SSL = (SSL*) vio->ssl_arg;
+    mysql_mutex_unlock(&LOCK_thd_data);
+#else
+    m_SSL = NULL;
+#endif
+  }
+
   inline void clear_active_vio()
   {
     mysql_mutex_lock(&LOCK_thd_data);
     active_vio = 0;
+    m_SSL = NULL;
     mysql_mutex_unlock(&LOCK_thd_data);
   }
 
@@ -4548,13 +4750,6 @@ public:
   void set_query_id(query_id_t new_query_id)
   {
     mysql_mutex_lock(&LOCK_thd_data);
-#ifndef DBUG_OFF
-    if (variables.query_exec_id != 0 &&
-        lex->sql_command != SQLCOM_SET_OPTION)
-    {
-      new_query_id= variables.query_exec_id;
-    }
-#endif
     query_id= new_query_id;
     mysql_mutex_unlock(&LOCK_thd_data);
   }
@@ -5311,8 +5506,11 @@ public:
 
   Temp_table_param()
     :copy_field(NULL), copy_field_end(NULL),
+     group_buff(NULL),
+     items_to_copy(NULL),
      recinfo(NULL), start_recinfo(NULL),
      keyinfo(NULL),
+     end_write_records(0),
      field_count(0), func_count(0), sum_func_count(0), hidden_field_count(0),
      group_parts(0), group_length(0), group_null_parts(0),
      quick_group(1),
@@ -5814,6 +6012,20 @@ inline void reattach_engine_ha_data_to_thd(THD *thd, const struct handlerton *ht
       replace_native_transaction_in_thd(thd, *trx_backup, NULL);
     *trx_backup= NULL;
   }
+}
+
+/**
+  Check if engine substitution is allowed in the current thread context.
+
+  @param thd         thread context
+  @return
+  @retval            true if engine substitution is allowed
+  @retval            false otherwise
+*/
+
+static inline bool is_engine_substitution_allowed(THD* thd)
+{
+  return !(thd->variables.sql_mode & MODE_NO_ENGINE_SUBSTITUTION);
 }
 
 /*************************************************************************/

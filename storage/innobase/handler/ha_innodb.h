@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2000, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2000, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -92,7 +92,7 @@ public:
 
 	uint max_supported_key_length() const;
 
-	uint max_supported_key_part_length() const;
+	uint max_supported_key_part_length(HA_CREATE_INFO *create_info) const;
 
 	const key_map* keys_to_use_for_scanning();
 
@@ -205,8 +205,10 @@ public:
 
 	void position(uchar *record);
 
+#ifdef WL6742
+	/* Removing WL6742 as part of Bug #23046302 */
 	virtual int records(ha_rows* num_rows);
-
+#endif
 	ha_rows records_in_range(
 		uint			inx,
 		key_range*		min_key,
@@ -214,6 +216,7 @@ public:
 
 	ha_rows estimate_rows_upper_bound();
 
+	virtual void adjust_create_info_for_frm(HA_CREATE_INFO *create_info);
 	void update_create_info(HA_CREATE_INFO* create_info);
 
 	int create(
@@ -358,10 +361,15 @@ public:
 	COLUMN_FORMAT_TYPE_COMPRESSED flag and updates
 	zip_dict_name / zip_dict_data for those which have associated
 	compression dictionaries.
-	@param thd Thread handle, used to determine whether it is necessary
-	to lock dict_sys mutex
+
+	@param	thd		Thread handle, used to determine whether it
+				is necessary to lock dict_sys mutex
+	@param	part_name	Full table name (including partition part).
+				Must be non-NULL only if called from
+				ha_partition.
 	*/
-	virtual void update_field_defs_with_zip_dict_info(THD* thd);
+	virtual void update_field_defs_with_zip_dict_info(THD* thd,
+		const char* part_name);
 
 	bool check_if_incompatible_data(
 		HA_CREATE_INFO*		info,
@@ -749,6 +757,9 @@ public:
 	/** Validate COMPRESSION option. */
 	bool create_option_compression_is_valid();
 
+	/** Validate ENCRYPTION option. */
+	bool create_option_encryption_is_valid() const;
+
 	/** Prepare to create a table. */
 	int prepare_create_table(const char* name);
 
@@ -802,6 +813,13 @@ public:
 		char*           norm_name,
 		const char*     name,
 		ibool           set_lower_case);
+
+	/** If encryption is requested, check for master key availability
+	and set the encryption flag in table flags
+	@param[in,out]	table	table object
+	@return on success DB_SUCCESS else DB_UNSPPORTED on failure */
+
+	dberr_t	enable_encryption(dict_table_t*	table);
 
 private:
 	/** Parses the table name into normal name and either temp path or
@@ -1123,7 +1141,7 @@ innobase_build_index_translation(
 
 /** Compression dictionary id container */
 typedef std::map<uint16, ulint, std::less<uint16>,
-	ut_allocator<std::pair<uint16, const ulint> > >
+	ut_allocator<std::pair<const uint16, ulint> > >
 	zip_dict_id_container_t;
 
 /** This function checks if all the compression dictionaries referenced

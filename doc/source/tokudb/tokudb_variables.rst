@@ -215,6 +215,16 @@ TokuDB Server Variables
      - Yes
      - Session, Global
      - Yes
+   * - :variable:`tokudb_enable_fast_update`
+     - Yes
+     - Yes
+     - Session, Global
+     - Yes
+   * - :variable:`tokudb_enable_fast_upsert`
+     - Yes
+     - Yes
+     - Session, Global
+     - Yes
    * - :variable:`tokudb_enable_partial_eviction`
      - Yes
      - Yes
@@ -771,11 +781,12 @@ inserts and queries while the index is being created.
   :scope: Global
   :dyn: No
   :vartype: String
+  :default: ``NULL``
 
 This variable configures the directory name where the |TokuDB| tables are
-stored. The default location is the |MySQL| data directory. For more
-information check :ref:`tokudb_files_and_file_types` and
-:ref:`tokudb_file_management`.
+stored. The default value is ``NULL`` which uses the location of the |MySQL|
+data directory. For more information check :ref:`tokudb_files_and_file_types`
+and :ref:`tokudb_file_management`.
 
 .. variable:: tokudb_debug
 
@@ -909,6 +920,32 @@ output:
 
 Defines direction to be used to perform table scan to check for empty tables
 for bulk loader.
+
+.. variable:: tokudb_enable_fast_update
+
+  :cli: Yes
+  :conf: Yes
+  :scope: Global/Session
+  :dyn: Yes
+  :vartype: Boolean
+  :default: OFF
+
+Toggles the fast updates feature ON/OFF for the ``UPDATE`` statement. Fast
+update involves queries optimization to avoid random reads during their
+execution.
+
+.. variable:: tokudb_enable_fast_upsert
+
+  :cli: Yes
+  :conf: Yes
+  :scope: Global/Session
+  :dyn: Yes
+  :vartype: Boolean
+  :default: OFF
+
+Toggles the fast updates feature ON/OFF for the ``INSERT`` statement. Fast
+update involves queries optimization to avoid random reads during their
+execution.
 
 .. variable:: tokudb_enable_partial_eviction
 
@@ -1120,12 +1157,13 @@ The following values are available:
   :scope: Global
   :dyn: No
   :vartype: String
+  :default: NULL
 
 This variable specifies the directory where the |TokuDB| log files are stored.
-The default location is the |MySQL| data directory. Configuring a separate log
-directory is somewhat involved. Please contact Percona support for more
-details. For more information check :ref:`tokudb_files_and_file_types` and
-:ref:`tokudb_file_management`.
+The default value is ``NULL`` which uses the location of the |MySQL| data
+directory. Configuring a separate log directory is somewhat involved. Please
+contact Percona support for more details. For more information check
+:ref:`tokudb_files_and_file_types` and :ref:`tokudb_file_management`.
 
 .. warning::
 

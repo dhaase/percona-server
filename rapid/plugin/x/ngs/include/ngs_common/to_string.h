@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016 Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2017, Oracle and/or its affiliates. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
@@ -23,6 +23,7 @@
 #include <string>
 #include <cstdlib>
 #include "mysql/service_my_snprintf.h"
+#include "m_string.h"
 
 namespace ngs {
 
@@ -35,30 +36,49 @@ inline std::string to_string(const char* const str, T value) {
   return buffer;
 }
 
+template <typename T>
+inline std::string to_string(const my_gcvt_arg_type arg_type, T value) {
+  char buffer[100];
+  my_gcvt(value, arg_type, sizeof(buffer)-1, buffer, NULL);
+  return buffer;
+}
+
 }  // namespace detail
 
-inline std::string to_string(int value) {
+inline std::string to_string(const bool value) {
+  return detail::to_string("%s", value ? "true" : "false");
+}
+
+inline std::string to_string(const int value) {
   return detail::to_string("%d", value);
 }
 
-inline std::string to_string(unsigned value) {
+inline std::string to_string(const unsigned value) {
   return detail::to_string("%u", value);
 }
 
-inline std::string to_string(long value) {
+inline std::string to_string(const long value) {
   return detail::to_string("%ld", value);
 }
 
-inline std::string to_string(long long value) {
+inline std::string to_string(const long long value) {
   return detail::to_string("%lld", value);
 }
 
-inline std::string to_string(unsigned long value) {
+inline std::string to_string(const unsigned long value) {
   return detail::to_string("%lu", value);
 }
 
-inline std::string to_string(unsigned long long value) {
+inline std::string to_string(const unsigned long long value) {
   return detail::to_string("%llu", value);
+}
+
+inline std::string to_string(const float value) {
+  return detail::to_string(MY_GCVT_ARG_FLOAT, value);
+}
+
+inline std::string to_string(const double value) {
+  return detail::to_string(MY_GCVT_ARG_DOUBLE, value);
 }
 
 inline int stoi(const std::string& str) { return std::atoi(str.c_str()); }

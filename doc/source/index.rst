@@ -66,10 +66,12 @@ Performance Improvements
    :maxdepth: 1
    :glob:
 
+   performance/aio_page_requests
    performance/query_cache_enhance
    performance/innodb_numa_support
    performance/threadpool
    performance/xtradb_performance_improvements_for_io-bound_highly-concurrent_workloads
+   performance/prefix_index_queries_optimization
 
 Flexibility Improvements
 ========================
@@ -81,6 +83,7 @@ Flexibility Improvements
    flexibility/log_warnings_suppress
    flexibility/improved_memory_engine
    flexibility/max_binlog_files
+   flexibility/extended_mysqldump
    flexibility/extended_select_into_outfile
    flexibility/per_query_variable_statement
    flexibility/extended_mysqlbinlog
@@ -89,6 +92,8 @@ Flexibility Improvements
    flexibility/proxy_protocol_support
    flexibility/per_session_server-id
    flexibility/compressed_columns
+   flexibility/innodb_fts_improvements
+   flexibility/binlogging_replication_improvements
 
 Reliability Improvements
 ========================
@@ -119,6 +124,7 @@ Management Improvements
    management/audit_log_plugin
    management/start_transaction_with_consistent_snapshot
    management/extended_show_grants
+   management/data_at_rest_encryption
 
 Diagnostics Improvements
 ========================
@@ -136,6 +142,7 @@ Diagnostics Improvements
    diagnostics/thread_based_profiling
    diagnostics/scalability_metrics_plugin
    diagnostics/response_time_distribution
+   diagnostics/innodb_fragmentation_count
 
 TokuDB
 ======
@@ -147,14 +154,33 @@ TokuDB
    tokudb/tokudb_intro
    tokudb/tokudb_installation
    tokudb/using_tokudb
+   tokudb/fast_updates
    tokudb/tokudb_files_and_file_types
    tokudb/tokudb_file_management
    tokudb/tokudb_background_analyze_table
    tokudb/tokudb_variables
+   tokudb/tokudb_status_variables
    tokudb/tokudb_troubleshooting
+   tokudb/tokudb_performance_schema
    tokudb/toku_backup
    tokudb/tokudb_faq
    tokudb/removing_tokudb
+
+Percona MyRocks
+===============
+
+.. toctree::
+   :maxdepth: 1
+   :glob:
+
+   Introduction <myrocks/index>
+   Installation <myrocks/install>
+   Limitations <myrocks/limitations>
+   Differences <myrocks/differences>
+   Server Variables <myrocks/variables>
+   Status Variables <myrocks/status_variables>
+   myrocks/gap_locks_detection
+   myrocks/data_loading
 
 Reference
 =========

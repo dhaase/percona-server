@@ -7,6 +7,7 @@ CREATE TEMPORARY TABLE t1 (a INT);
 
 --echo ### Setup debug_sync points and prepare for slave backup
 --connection slave_2
+SET SESSION debug="+d,debug_sync_abort_on_timeout";
 
 SHOW STATUS LIKE 'Slave_open_temp_tables';
 
@@ -27,6 +28,7 @@ SET GLOBAL tokudb_backup_safe_slave_timeout=30;
 --enable_query_log
 
 --connection server_2
+SET SESSION debug="+d,debug_sync_abort_on_timeout";
 
 --echo ### Wait for safe slave function to start
 SET DEBUG_SYNC = "now WAIT_FOR sse";
@@ -57,9 +59,6 @@ SHOW STATUS LIKE 'Slave_open_temp_tables';
 --echo ### Continue backup
 --disable_warnings
 SET DEBUG_SYNC = "now SIGNAL ttlss_continue";
-
---echo ## Reset debug_sync points
-SET DEBUG_SYNC = "RESET";
 
 --connection slave_2
 --echo ### Wait for backup finish

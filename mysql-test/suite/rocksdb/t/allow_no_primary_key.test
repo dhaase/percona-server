@@ -1,4 +1,5 @@
---source include/have_rocksdb_as_default.inc
+--source include/have_rocksdb.inc
+--source include/count_sessions.inc
 
 #
 # This test checks some very basic capabilities
@@ -6,13 +7,9 @@
 # in myrocks.  Everything should work here as normal.
 #
 
---disable_warnings
-DROP TABLE IF EXISTS t1;
---enable_warnings
-
 # test CREATE
 CREATE TABLE t1 (a INT, b CHAR(8)) ENGINE=rocksdb;
---source no_primary_key_basic_ops.inc
+--source suite/rocksdb/include/no_primary_key_basic_ops.inc
 DROP TABLE t1;
 
 ## test ALTER
@@ -32,7 +29,7 @@ DROP TABLE t1;
 ## test creating a table with primary and then dropping that key
 CREATE TABLE t1 (a INT, b CHAR(8), pk INT AUTO_INCREMENT PRIMARY KEY) ENGINE=rocksdb;
 ALTER TABLE t1 DROP COLUMN pk;
---source no_primary_key_basic_ops.inc
+--source suite/rocksdb/include/no_primary_key_basic_ops.inc
 DROP TABLE t1;
 
 # test CHECK TABLE
@@ -42,10 +39,6 @@ DROP TABLE t1;
 # in which case rdiff will be needed. Or, the output might say that
 # the storage engine does not support CHECK.
 #
-
---disable_warnings
-DROP TABLE IF EXISTS t1,t2;
---enable_warnings
 
 CREATE TABLE t1 (a INT, b CHAR(8)) ENGINE=rocksdb;
 INSERT INTO t1 (a,b) VALUES (1,'a'),(2,'b');
@@ -71,9 +64,16 @@ CHECK TABLE t1 CHANGED;
 
 DROP TABLE t1, t2;
 
-# test disabling unique keys
---error 1105
+# test unique keys with no primary key
 CREATE TABLE t1 (a INT, b CHAR(8), UNIQUE INDEX(a)) ENGINE=rocksdb;
+INSERT INTO t1 (a,b) VALUES (1,'a'),(2,'b');
+--error ER_DUP_ENTRY
+INSERT INTO t1 (a,b) VALUES (1,'c');
+SELECT * FROM t1 ORDER BY a, b;
+SELECT * FROM t1 WHERE a = 2;
+EXPLAIN SELECT * FROM t1 WHERE a = 2;
+
+DROP TABLE t1;
 
 ## test restarting a table that has no data
 CREATE TABLE t1 (a INT, b CHAR(8)) ENGINE=rocksdb;
@@ -89,3 +89,33 @@ DELETE FROM t1 WHERE a = 35 AND b = 'foo';
 --sorted_result
 SELECT * FROM t1;
 DROP TABLE t1;
+
+--echo #
+--echo # Issue #834/MDEV-15304 ALTER TABLE table_with_hidden_pk causes Can't
+--echo #   write; duplicate key in table error and/or crash
+--echo #
+CREATE TABLE t1 (a INT, KEY(a)) ENGINE=RocksDB;
+INSERT INTO t1 VALUES (1),(1+1);
+create table t2 (a int);
+insert into t2 values (10),(20),(30);
+
+BEGIN;
+select * from t2;
+
+connect (con1,localhost,root,,);
+connection con1;
+alter table t1 force;
+
+connection default;
+select * from t1;
+
+connection con1;
+insert into t1 values (100);
+select * from t1;
+
+disconnect con1;
+connection default;
+rollback;
+drop table t1,t2;
+
+--source include/wait_until_count_sessions.inc

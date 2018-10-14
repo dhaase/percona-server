@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2011, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2011, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -223,6 +223,7 @@ or greater than fts_max_token_size.
 @param[in]	stopwords	stopwords rb tree
 @param[in]	is_ngram	is ngram parser
 @param[in]	cs		token charset
+@param[in]	skip		true if the check should be skipped
 @retval true	if it is not stopword and length in range
 @retval false	if it is stopword or length not in range */
 bool
@@ -230,7 +231,8 @@ fts_check_token(
 	const fts_string_t*	token,
 	const ib_rbt_t*		stopwords,
 	bool			is_ngram,
-	const CHARSET_INFO*	cs);
+	const CHARSET_INFO*	cs,
+	bool			skip);
 
 /*******************************************************************//**
 Tokenize a document. */
@@ -594,20 +596,6 @@ fts_get_table_id(
 					FTS_AUX_MIN_TABLE_ID_LENGTH bytes
 					long */
 	MY_ATTRIBUTE((warn_unused_result));
-
-/******************************************************************//**
-Add the table to add to the OPTIMIZER's list. */
-void
-fts_optimize_add_table(
-/*===================*/
-	dict_table_t*	table);		/*!< in: table to add */
-
-/******************************************************************//**
-Optimize a table. */
-void
-fts_optimize_do_table(
-/*==================*/
-	dict_table_t*	table);		/*!< in: table to optimize */
 
 /******************************************************************//**
 Construct the prefix name of an FTS table.

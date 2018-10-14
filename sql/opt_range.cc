@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -788,6 +788,27 @@ public:
       }
     }
   }
+
+  /**
+    Update use count for SEL_ARG's next_key_part.
+    This function does NOT update use_count of the current
+    SEL_ARG object.
+
+    Primarily used for reducing reference count of next_key_part of a
+    node when removed from SEL_ARG tree during tree merge operations.
+
+    @param count The number of additional references to this SEL_ARG
+                 tree.
+  */
+  void increment_next_key_part_use_count(long count)
+  {
+    if (next_key_part)
+    {
+      next_key_part->use_count+= count;
+      next_key_part->increment_use_count(count);
+    }
+  }
+
   void free_tree()
   {
     for (SEL_ARG *pos=first(); pos ; pos=pos->next)
@@ -1585,7 +1606,7 @@ QUICK_INDEX_MERGE_SELECT::QUICK_INDEX_MERGE_SELECT(THD *thd_param,
   DBUG_ENTER("QUICK_INDEX_MERGE_SELECT::QUICK_INDEX_MERGE_SELECT");
   index= MAX_KEY;
   head= table;
-  memset(&read_record, 0, sizeof(read_record));
+
   init_sql_alloc(key_memory_quick_index_merge_root,
                  &alloc, thd->variables.range_alloc_block_size, 0);
   DBUG_VOID_RETURN;
@@ -8032,9 +8053,11 @@ and_all_keys(RANGE_OPT_PARAM *param, SEL_ARG *key1, SEL_ARG *key2,
   ulong use_count=key1->use_count;
 
   DBUG_ASSERT(key1->elements > 0);
-  key2->use_count+= key1->elements;
-  key2->increment_use_count(key1->elements);
-
+  if (key1->elements != 1)
+  {
+    key2->use_count+=key1->elements-1; //psergey: why we don't count that key1 has n-k-p?
+    key2->increment_use_count((int) key1->elements-1);
+  }
   if (key1->type == SEL_ARG::MAYBE_KEY)
   {
     // See todo for left/right pointers
@@ -8567,7 +8590,7 @@ key_or(RANGE_OPT_PARAM *param, SEL_ARG *key1, SEL_ARG *key2)
           Use the relevant range in key1.
         */
         cur_key1->merge_flags(cur_key2);        // Copy maybe flags
-        cur_key2->increment_use_count(-1);      // Free not used tree
+        cur_key2->increment_next_key_part_use_count(-1);  // Free not used tree
       }
       else
       {
@@ -8697,15 +8720,11 @@ key_or(RANGE_OPT_PARAM *param, SEL_ARG *key1, SEL_ARG *key2)
 
             Move on to next range in key2
           */
-          if (cur_key2->next_key_part)
-          {
-            /*
-              cur_key2 will no longer be used. Reduce reference count
-              of SEL_ARGs in its next_key_part.
-            */
-            cur_key2->next_key_part->use_count--;
-            cur_key2->next_key_part->increment_use_count(-1);
-          }
+          /*
+            cur_key2 will no longer be used. Reduce reference count
+            of SEL_ARGs in its next_key_part.
+          */
+          cur_key2->increment_next_key_part_use_count(-1);
           cur_key2= cur_key2->next;
           continue;
         }
@@ -9044,7 +9063,7 @@ SEL_ARG::tree_delete(SEL_ARG *key)
     key->prev->next=key->next;
   if (key->next)
     key->next->prev=key->prev;
-  key->increment_use_count(-1);
+  key->increment_next_key_part_use_count(-1);
   if (!key->parent)
     par= &root;
   else
@@ -10550,8 +10569,7 @@ QUICK_RANGE_SELECT *get_quick_select_for_ref(THD *thd, TABLE *table,
     goto err;
   quick->records= records;
 
-  if ((cp_buffer_from_ref(thd, table, ref) && thd->is_fatal_error) ||
-      !(range= new (alloc) QUICK_RANGE()))
+  if (!(range= new (alloc) QUICK_RANGE()))
     goto err;                                   // out of memory
 
   range->min_key= range->max_key= ref->key_buff;
@@ -10991,13 +11009,36 @@ int QUICK_RANGE_SELECT::reset()
 
   if (!file->inited)
   {
+    /*
+      read_set is set to the correct value for ror_merge_scan here as a
+      subquery execution during optimization might result in innodb not
+      initializing the read set in index_read() leading to wrong
+      results while merging.
+    */
+    MY_BITMAP * const save_read_set= head->read_set;
+    MY_BITMAP * const save_write_set= head->write_set;
     const bool sorted= (mrr_flags & HA_MRR_SORTED);
     DBUG_EXECUTE_IF("bug14365043_2",
                     DBUG_SET("+d,ha_index_init_fail"););
+
+    /* Pass index specifc read set for ror_merged_scan */
+    if (in_ror_merged_scan)
+    {
+      /*
+        We don't need to signal the bitmap change as the bitmap is always the
+        same for this head->file
+      */
+      head->column_bitmaps_set_no_signal(&column_bitmap, &column_bitmap);
+    }
     if ((error= file->ha_index_init(index, sorted)))
     {
       file->print_error(error, MYF(0));
       DBUG_RETURN(error);
+    }
+    if (in_ror_merged_scan)
+    {
+      /* Restore bitmaps set on entry */
+      head->column_bitmaps_set_no_signal(save_read_set, save_write_set);
     }
   }
 
@@ -11452,8 +11493,14 @@ int QUICK_SELECT_DESC::get_next()
       will use ha_index_prev() to read data, we need to let the
       handler know where to end the scan in order to avoid that the
       ICP implemention continues to read past the range boundary.
+
+      An addition for MyRocks:
+      MyRocks needs to know both start of the range and end of the range
+      in order to use its bloom filters. This is useful regardless of whether
+      ICP is usable (e.g. it is used for index-only scans which do not use
+      ICP). Because of that, we remove the following:
+      //  //  if (file->pushed_idx_cond)
     */
-    if (file->pushed_idx_cond)
     {
       if (!eqrange_all_keyparts)
       {
@@ -11840,6 +11887,11 @@ static bool
 check_group_min_max_predicates(Item *cond, Item_field *min_max_arg_item,
                                Field::imagetype image_type);
 
+static bool
+min_max_inspect_cond_for_fields(Item *cond, Item_field *min_max_arg_item,
+                                bool *min_max_arg_present,
+                                bool *non_min_max_arg_present);
+
 static void
 cost_group_min_max(TABLE* table, uint key, uint used_key_parts,
                    uint group_key_parts, SEL_TREE *range_tree,
@@ -12095,6 +12147,43 @@ get_best_group_min_max(PARAM *param, SEL_TREE *tree, const Cost_estimate *cost_e
     }
   }
 
+  /**
+    Test (Part of WA2): Skip loose index scan on disjunctive WHERE clause which
+    results in null tree or merge tree.
+  */
+  if (tree && !tree->merges.is_empty())
+  {
+    /**
+      The tree structure contains multiple disjoint trees. This happens when
+      the WHERE clause can't be represented in a single range tree due to the
+      disjunctive nature of it but there exists indexes to perform index
+      merge scan.
+    */
+    trace_group.add("chosen", false).
+      add_alnum("cause", "disjuntive_predicate_present");
+    DBUG_RETURN(NULL);
+  }
+  else if (!tree && join->where_cond && min_max_arg_item)
+  {
+    /**
+      Skip loose index scan if min_max attribute is present along with
+      at least one other attribute in the WHERE cluse when the tree is null.
+      There is no range tree if WHERE condition can't be represented in a
+      single range tree and index merge is not possible.
+    */
+    bool min_max_arg_present= false;
+    bool non_min_max_arg_present= false;
+    if (min_max_inspect_cond_for_fields(join->where_cond,
+                                        min_max_arg_item,
+                                        &min_max_arg_present,
+                                        &non_min_max_arg_present))
+    {
+      trace_group.add("chosen", false).
+        add_alnum("cause", "minmax_keypart_in_disjunctive_query");
+      DBUG_RETURN(NULL);
+    }
+  }
+
   /* Check (SA7). */
   if (is_agg_distinct && (have_max || have_min))
   {
@@ -12188,7 +12277,7 @@ get_best_group_min_max(PARAM *param, SEL_TREE *tree, const Cost_estimate *cost_e
           part of 'cur_index'
         */
         if (bitmap_is_set(table->read_set, cur_field->field_index) &&
-            !cur_field->part_of_key_not_clustered.is_set(cur_index))
+            !cur_field->is_part_of_actual_key(thd, cur_index, cur_index_info))
         {
           cause= "not_covering";
           goto next_index;                  // Field was not part of key
@@ -12387,7 +12476,7 @@ get_best_group_min_max(PARAM *param, SEL_TREE *tree, const Cost_estimate *cost_e
 
         /* Check if cur_part is referenced in the WHERE clause. */
         if (join->where_cond->walk(&Item::find_item_in_field_list_processor,
-                                   Item::WALK_POSTFIX,
+                                   Item::WALK_SUBQUERY_POSTFIX,
                                    (uchar*) key_part_range))
         {
           cause= "keypart_reference_from_where_clause";
@@ -12415,7 +12504,7 @@ get_best_group_min_max(PARAM *param, SEL_TREE *tree, const Cost_estimate *cost_e
     }
 
     /**
-      Test WA2:If there are conditions on a column C participating in
+      Test Part of WA2:If there are conditions on a column C participating in
       MIN/MAX, those conditions must be conjunctions to all earlier
       keyparts. Otherwise, Loose Index Scan cannot be used.
     */
@@ -12607,6 +12696,8 @@ check_group_min_max_predicates(Item *cond, Item_field *min_max_arg_item,
     be done, is that here we should analyze whether the subselect references
     the MIN/MAX argument field, and disallow the optimization only if this is
     so.
+    Need to handle subselect in min_max_inspect_cond_for_fields() once this
+    is fixed.
   */
   if (cond_type == Item::SUBSELECT_ITEM)
     DBUG_RETURN(FALSE);
@@ -12738,6 +12829,147 @@ check_group_min_max_predicates(Item *cond, Item_field *min_max_arg_item,
   DBUG_RETURN(TRUE);
 }
 
+/**
+  Utility function used by min_max_inspect_cond_for_fields() for comparing
+  FILED item with given MIN/MAX item and setting appropriate out paramater.
+
+@param         item_field         Item field for comparison.
+@param         min_max_arg_item   The field referenced by the MIN/MAX
+                                  function(s).
+@param [out]   min_max_arg_present    This out parameter is set to true if
+                                      MIN/MAX argument is present in cond.
+@param [out]   non_min_max_arg_present This out parameter is set to true if
+                                       any field item other than MIN/MAX
+                                       argument is present in cond.
+*/
+static inline void util_min_max_inspect_item(Item *item_field,
+                                             Item_field *min_max_arg_item,
+                                             bool *min_max_arg_present,
+                                             bool *non_min_max_arg_present)
+{
+  if (item_field->type() == Item::FIELD_ITEM)
+  {
+    if(min_max_arg_item->eq(item_field, 1))
+      *min_max_arg_present= true;
+    else
+      *non_min_max_arg_present= true;
+  }
+}
+
+/**
+  This function detects the presents of MIN/MAX field along with at least
+  one non MIN/MAX field participation in the given condition. Subqueries
+  inspection is skipped as of now.
+
+  @param         cond   tree (or subtree) describing all or part of the WHERE
+                        clause being analyzed.
+  @param         min_max_arg_item   The field referenced by the MIN/MAX
+                                    function(s).
+  @param [out]   min_max_arg_present    This out parameter is set to true if
+                                        MIN/MAX argument is present in cond.
+  @param [out]   non_min_max_arg_present This out parameter is set to true if
+                                         any field item other than MIN/MAX
+                                         argument is present in cond.
+
+  @return  TRUE if both MIN/MAX field and non MIN/MAX field is present in cond.
+           FALSE o/w.
+
+  @todo: When the hack present in check_group_min_max_predicate() is removed,
+         subqueries needs to be inspected.
+*/
+
+static bool
+min_max_inspect_cond_for_fields(Item *cond, Item_field *min_max_arg_item,
+                                bool *min_max_arg_present,
+                                bool *non_min_max_arg_present)
+{
+  DBUG_ENTER("inspect_cond_for_fields");
+  DBUG_ASSERT(cond && min_max_arg_item);
+
+  cond= cond->real_item();
+  Item::Type cond_type= cond->type();
+
+  switch (cond_type)  {
+    case Item::COND_ITEM:  {
+      DBUG_PRINT("info", ("Analyzing: %s", ((Item_func*) cond)->func_name()));
+      List_iterator_fast<Item> li(*((Item_cond*) cond)->argument_list());
+      Item *and_or_arg;
+      while ((and_or_arg= li++))
+      {
+        min_max_inspect_cond_for_fields(and_or_arg, min_max_arg_item,
+                                            min_max_arg_present,
+                                            non_min_max_arg_present);
+        if (*min_max_arg_present && *non_min_max_arg_present)
+          DBUG_RETURN(true);
+      }
+
+      DBUG_RETURN(false);
+    }
+    case Item::FUNC_ITEM:  {
+      /* Test if cond references both group-by and non-group fields. */
+      Item_func *pred= (Item_func*) cond;
+      Item *cur_arg;
+      DBUG_PRINT("info", ("Analyzing: %s", pred->func_name()));
+      for (uint arg_idx= 0; arg_idx < pred->argument_count(); arg_idx++)
+      {
+        Item **arguments= pred->arguments();
+        cur_arg= arguments[arg_idx]->real_item();
+        DBUG_PRINT("info", ("cur_arg: %s", cur_arg->full_name()));
+
+        if (cur_arg->type() == Item::FUNC_ITEM)
+        {
+          min_max_inspect_cond_for_fields(cur_arg, min_max_arg_item,
+                                              min_max_arg_present,
+                                              non_min_max_arg_present);
+        }
+        else
+        {
+          util_min_max_inspect_item(cur_arg,
+                                    min_max_arg_item,
+                                    min_max_arg_present,
+                                    non_min_max_arg_present);
+        }
+
+        if (*min_max_arg_present && *non_min_max_arg_present)
+          DBUG_RETURN(true);
+      }
+
+      if (pred->functype() == Item_func::MULT_EQUAL_FUNC)
+      {
+        /*
+          Analyze participating fields in a multiequal condition.
+        */
+        Item_equal_iterator it(*(Item_equal*)cond);
+
+        Item *item_field;
+        while ((item_field= it++))
+        {
+          util_min_max_inspect_item(item_field,
+                                    min_max_arg_item,
+                                    min_max_arg_present,
+                                    non_min_max_arg_present);
+
+          if (*min_max_arg_present && *non_min_max_arg_present)
+            DBUG_RETURN(true);
+        }
+      }
+
+      break;
+    }
+    case Item::FIELD_ITEM:  {
+      util_min_max_inspect_item(cond,
+                                min_max_arg_item,
+                                min_max_arg_present,
+                                non_min_max_arg_present);
+      DBUG_PRINT("info", ("Analyzing: %s", cond->full_name()));
+      DBUG_RETURN(false);
+    }
+    default:
+      break;
+  }
+
+  DBUG_RETURN(false);
+}
 
 /*
   Get the SEL_ARG tree 'tree' for the keypart covering 'field', if

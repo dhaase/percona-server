@@ -14,6 +14,9 @@ Version Specific Information
  * :rn:`5.7.10-1`: 
     Feature ported from |Percona Server| 5.6
 
+ * :rn:`5.7.22-22`:
+    Feature reverted from the upstream implementation back to the one ported from |Percona Server| 5.6, in which `innodb_numa_interleave <http://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_numa_interleave>`_ variable not only enables NUMA memory interleaving  at InnoDB buffer pool allocation, but allocates buffer pool with MAP_POPULATE, forcing interleaved allocation at the buffer pool initialization time.
+
 Command-line Options for mysqld_safe
 ====================================
 
@@ -24,10 +27,10 @@ Command-line Options for mysqld_safe
      :location: mysqld_safe
      :dyn: No
      :vartype: Boolean
-     :default: OFF
-     :range: ON/OFF
+     :default: ``0`` (OFF)
+     :range: ``0``/``1``
 
-When enabled this will flush and purge buffers/caches before starting the server to help ensure ``NUMA`` allocation fairness across nodes. This option is useful for establishing a consistent and predictable behavior for normal usage and/or benchmarking.
+When enabled (set to ``1``) this will flush and purge buffers/caches before starting the server to help ensure ``NUMA`` allocation fairness across nodes. This option is useful for establishing a consistent and predictable behavior for normal usage and/or benchmarking.
 
 Other Reading
 =============

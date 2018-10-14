@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -52,6 +52,8 @@ Created 10/25/1995 Heikki Tuuri
 #include "srv0start.h"
 #include "trx0purge.h"
 #include "ut0new.h"
+#include "btr0sea.h"
+#include "log0log.h"
 
 /** Tries to close a file in the LRU list. The caller must hold the fil_sys
 mutex.
@@ -232,7 +234,7 @@ bool
 fil_is_user_tablespace_id(
 	ulint	space_id)
 {
-	return(space_id > srv_undo_tablespaces_open
+	return(!srv_is_undo_tablespace(space_id)
 	       && space_id != srv_tmp_space.space_id());
 }
 
@@ -547,15 +549,13 @@ Try and enable FusionIO atomic writes.
 @param[in] file		OS file handle
 @return true if successful */
 bool
-fil_fusionio_enable_atomic_write(os_file_t file)
+fil_fusionio_enable_atomic_write(pfs_os_file_t file)
 {
 	if (srv_unix_file_flush_method == SRV_UNIX_O_DIRECT) {
 
 		uint	atomic = 1;
-
-		ut_a(file != -1);
-
-		if (ioctl(file, DFS_IOCTL_ATOMIC_WRITE_SET, &atomic) != -1) {
+		ut_a(file.m_file != -1);
+		if (ioctl(file.m_file, DFS_IOCTL_ATOMIC_WRITE_SET, &atomic) != -1) {
 
 			return(true);
 		}
@@ -2997,20 +2997,43 @@ fil_prepare_for_truncate(
 	return(err);
 }
 
-/**********************************************************************//**
-Reinitialize the original tablespace header with the same space id
-for single tablespace */
+/** Reinitialize the original tablespace header with the same space id
+for single tablespace
+@param[in]      table		table belongs to tablespace
+@param[in]      size            size in blocks
+@param[in]      trx             Transaction covering truncate */
 void
-fil_reinit_space_header(
-/*====================*/
-	ulint		id,	/*!< in: space id */
-	ulint		size)	/*!< in: size in blocks */
+fil_reinit_space_header_for_table(
+	dict_table_t*	table,
+	ulint		size,
+	trx_t*		trx)
 {
+	ulint	id = table->space;
+
 	ut_a(!is_system_tablespace(id));
 
 	/* Invalidate in the buffer pool all pages belonging
-	to the tablespace */
+	to the tablespace. The buffer pool scan may take long
+	time to complete, therefore we release dict_sys->mutex
+	and the dict operation lock during the scan and aquire
+	it again after the buffer pool scan.*/
+
+	/* Release the lock on the indexes too. So that
+	they won't violate the latch ordering. */
+	dict_table_x_unlock_indexes(table);
+	row_mysql_unlock_data_dictionary(trx);
+	DEBUG_SYNC_C("trunc_table_index_dropped_release_dict_lock");
+
+	/* Lock the search latch in shared mode to prevent user
+	from disabling AHI during the scan */
+	btr_search_s_lock_all();
+	DEBUG_SYNC_C("simulate_buffer_pool_scan");
 	buf_LRU_flush_or_remove_pages(id, BUF_REMOVE_ALL_NO_WRITE, 0);
+	btr_search_s_unlock_all();
+
+	row_mysql_lock_data_dictionary(trx);
+
+	dict_table_x_lock_indexes(table);
 
 	/* Remove all insert buffer entries for the tablespace */
 	ibuf_delete_for_discarded_space(id);
@@ -3507,7 +3530,7 @@ fil_ibd_create(
 	ulint		flags,
 	ulint		size)
 {
-	os_file_t	file;
+	pfs_os_file_t	file;
 	dberr_t		err;
 	byte*		buf2;
 	byte*		page;
@@ -3517,7 +3540,7 @@ fil_ibd_create(
 	bool		has_shared_space = FSP_FLAGS_GET_SHARED(flags);
 	fil_space_t*	space = NULL;
 
-	ut_ad(!is_system_tablespace(space_id));
+	ut_ad(!is_shared_system_tablespace(space_id));
 	ut_ad(!srv_read_only_mode);
 	ut_a(space_id < SRV_LOG_SPACE_FIRST_ID);
 	ut_a(size >= FIL_IBD_FILE_INITIAL_SIZE);
@@ -3576,7 +3599,7 @@ fil_ibd_create(
 	if (fil_fusionio_enable_atomic_write(file)) {
 
 		/* This is required by FusionIO HW/Firmware */
-		int	ret = posix_fallocate(file, 0, size * UNIV_PAGE_SIZE);
+		int     ret = posix_fallocate(file.m_file, 0, size * UNIV_PAGE_SIZE);
 
 		if (ret != 0) {
 
@@ -3628,9 +3651,7 @@ fil_ibd_create(
 	if (punch_hole) {
 
 		dberr_t	punch_err;
-
-		punch_err = os_file_punch_hole(file, 0, size * UNIV_PAGE_SIZE);
-
+		punch_err = os_file_punch_hole(file.m_file, 0, size * UNIV_PAGE_SIZE);
 		if (punch_err != DB_SUCCESS) {
 			punch_hole = false;
 		}
@@ -4553,7 +4574,8 @@ fil_ibd_load(
 			break;
 		}
 
-		/* Fall through to error handling */
+		// fallthrough
+		// to error handling
 
 	case DB_TABLESPACE_EXISTS:
 #ifdef UNIV_HOTBACKUP
@@ -4948,10 +4970,10 @@ fil_write_zeros(
 			request, node->name, node->handle, buf, offset,
 			n_bytes);
 #else
-		err = os_aio(
+		err = os_aio_func(
 			request, OS_AIO_SYNC, node->name,
 			node->handle, buf, offset, n_bytes, read_only_mode,
-			NULL, NULL, node->space->id, NULL);
+			NULL, NULL, node->space->id, NULL, false);
 #endif /* UNIV_HOTBACKUP */
 
 		if (err != DB_SUCCESS) {
@@ -5074,27 +5096,41 @@ retry:
 		ut_ad(len > 0);
 
 #if !defined(NO_FALLOCATE) && defined(UNIV_LINUX)
-		/* This is required by FusionIO HW/Firmware */
-		int	ret = posix_fallocate(node->handle, node_start, len);
+		int     ret = posix_fallocate(node->handle.m_file, node_start, len);
 
-		/* We already pass the valid offset and len in, if EINVAL
-		is returned, it could only mean that the file system doesn't
-		support fallocate(), currently one known case is
-		ext3 FS with O_DIRECT. We ignore EINVAL here so that the
-		error message won't flood. */
-		if (ret != 0 && ret != EINVAL) {
-			ib::error()
-				<< "posix_fallocate(): Failed to preallocate"
-				" data for file "
-				<< node->name << ", desired size "
-				<< len << " bytes."
-				" Operating system error number "
-				<< ret << ". Check"
-				" that the disk is not full or a disk quota"
-				" exceeded. Make sure the file system supports"
-				" this function. Some operating system error"
-				" numbers are described at " REFMAN
-				" operating-system-error-codes.html";
+		DBUG_EXECUTE_IF("ib_posix_fallocate_fail_eintr",
+				ret = EINTR;);
+
+		DBUG_EXECUTE_IF("ib_posix_fallocate_fail_einval",
+				ret = EINVAL;);
+
+		if (ret != 0) {
+			/* We already pass the valid offset and len in,
+			if EINVAL is returned, it could only mean that the
+			file system doesn't support fallocate(), currently
+			one known case is ext3 with O_DIRECT.
+
+			Also because above call could be interrupted,
+			in this case, simply go to plan B by writing zeroes.
+
+			Both error messages for above two scenarios are
+			skipped in case of flooding error messages, because
+			they can be ignored by users. */
+			if (ret != EINTR && ret != EINVAL) {
+				ib::error()
+					<< "posix_fallocate(): Failed to"
+					" preallocate data for file "
+					<< node->name << ", desired size "
+					<< len << " bytes."
+					" Operating system error number "
+					<< ret << ". Check"
+					" that the disk is not full or a disk"
+					" quota exceeded. Make sure the file"
+					" system supports this function."
+					" Some operating system error"
+					" numbers are described at " REFMAN
+					"operating-system-error-codes.html";
+			}
 
 			err = DB_IO_ERROR;
 		}
@@ -5452,18 +5488,49 @@ fil_io_set_encryption(
 	const page_id_t&	page_id,
 	fil_space_t*		space)
 {
-	/* Don't encrypt the log, page 0 of all tablespaces, all pages
-	from the system tablespace. */
-	if (!req_type.is_log() && page_id.page_no() > 0
-	    && space->encryption_type != Encryption::NONE)
-	{
-		req_type.encryption_key(space->encryption_key,
-					space->encryption_klen,
-					space->encryption_iv);
-		req_type.encryption_algorithm(Encryption::AES);
-	} else {
+
+	/* Explicit request to disable encryption */
+	if (req_type.is_encryption_disabled()) {
 		req_type.clear_encrypted();
+		return;
 	}
+
+	/* Don't encrypt pages of system tablespace upto
+	TRX_SYS_PAGE(including). The doublewrite buffer
+	header is on TRX_SYS_PAGE */
+	if (is_shared_system_tablespace(space->id)
+	    && page_id.page_no() <= FSP_TRX_SYS_PAGE_NO) {
+		req_type.clear_encrypted();
+		return;
+	}
+
+	/* Don't encrypt redo log and system tablespaces,
+	for all the other types tablespaces, don't encrypt page 0. */
+	if (space->encryption_type == Encryption::NONE
+	    || (page_id.page_no() == 0 && !req_type.is_log())) {
+		req_type.clear_encrypted();
+		return;
+	}
+
+	/* For writing redo log, if encryption for redo log is disabled,
+	skip setting encryption. */
+	if (req_type.is_log() && req_type.is_write()) {
+		req_type.clear_encrypted();
+		return;
+	}
+
+	/* For writing temporary tablespace, if encryption for temporary
+	tablespace is disabled, skip setting encryption. */
+	if (fsp_is_system_temporary(space->id)
+	    && !srv_tmp_tablespace_encrypt && req_type.is_write()) {
+		req_type.clear_encrypted();
+		return;
+	}
+
+	req_type.encryption_key(space->encryption_key,
+				space->encryption_klen,
+				space->encryption_iv);
+	req_type.encryption_algorithm(Encryption::AES);
 }
 
 /** Reads or writes data. This operation could be asynchronous (aio).
@@ -5482,6 +5549,12 @@ fil_io_set_encryption(
 			aligned
 @param[in] message	message for aio handler if non-sync aio
 			used, else ignored
+@param[in] should_buffer
+			whether to buffer an aio request.
+			AIO read ahead uses this. If you plan to
+			use this parameter, make sure you remember
+			to call os_aio_dispatch_read_array_submit()
+			when you're ready to commit all your requests.
 
 @return DB_SUCCESS, DB_TABLESPACE_DELETED or DB_TABLESPACE_TRUNCATED
 	if we are trying to do i/o on a tablespace which does not exist */
@@ -5495,12 +5568,12 @@ _fil_io(
 	ulint			len,
 	void*			buf,
 	void*			message,
-	trx_t*			trx)
+	trx_t*			trx,
+	bool			should_buffer)
 {
 	os_offset_t		offset;
 	IORequest		req_type(type);
 
-	ut_ad(!trx || trx->take_stats);
 	ut_ad(req_type.validate());
 
 	ut_ad(len > 0);
@@ -5695,6 +5768,9 @@ _fil_io(
 			space->name, byte_offset, len, req_type.is_read());
 	}
 
+	/* Set encryption information. */
+	fil_io_set_encryption(req_type, page_id, space);
+
 	/* Now we have made the changes in the data structures of fil_system */
 	mutex_exit(&fil_system->mutex);
 
@@ -5783,9 +5859,6 @@ _fil_io(
 		req_type.clear_compressed();
 	}
 
-	/* Set encryption information. */
-	fil_io_set_encryption(req_type, page_id, space);
-
 	req_type.block_size(node->block_size);
 
 	dberr_t	err;
@@ -5811,7 +5884,7 @@ _fil_io(
 		mode, node->name, node->handle, buf, offset, len,
 		fsp_is_system_temporary(page_id.space())
 		? false : srv_read_only_mode,
-		node, message, page_id.space(), trx);
+		node, message, page_id.space(), trx, should_buffer);
 
 #endif /* UNIV_HOTBACKUP */
 
@@ -5925,7 +5998,7 @@ fil_flush(
 				log files or a tablespace of the database) */
 {
 	fil_node_t*	node;
-	os_file_t	file;
+	pfs_os_file_t	file;
 
 	mutex_enter(&fil_system->mutex);
 
@@ -6312,7 +6385,7 @@ fil_buf_block_init(
 }
 
 struct fil_iterator_t {
-	os_file_t	file;			/*!< File handle */
+	pfs_os_file_t	file;			/*!< File handle */
 	const char*	filepath;		/*!< File path name */
 	os_offset_t	start;			/*!< From where to start */
 	os_offset_t	end;			/*!< Where to stop */
@@ -6493,7 +6566,7 @@ fil_tablespace_iterate(
 	PageCallback&	callback)
 {
 	dberr_t		err;
-	os_file_t	file;
+	pfs_os_file_t	file;
 	char*		filepath;
 	bool		success;
 
@@ -6943,8 +7016,9 @@ fil_space_validate_for_mtr_commit(
 {
 	ut_ad(!mutex_own(&fil_system->mutex));
 	ut_ad(space != NULL);
-	ut_ad(space->purpose == FIL_TYPE_TABLESPACE);
-	ut_ad(!is_predefined_tablespace(space->id));
+	ut_ad(space->purpose == FIL_TYPE_TABLESPACE ||
+		space->purpose == FIL_TYPE_TEMPORARY);
+	ut_ad(!is_shared_system_tablespace(space->id));
 
 	/* We are serving mtr_commit(). While there is an active
 	mini-transaction, we should have !space->stop_new_ops. This is
@@ -7034,6 +7108,12 @@ fil_names_clear(
 	bool	do_write)
 {
 	mtr_t	mtr;
+	ulint	mtr_checkpoint_size = LOG_CHECKPOINT_FREE_PER_THREAD;
+
+	DBUG_EXECUTE_IF(
+		"increase_mtr_checkpoint_size",
+		mtr_checkpoint_size = 75 * 1024;
+		);
 
 	ut_ad(log_mutex_own());
 
@@ -7067,11 +7147,24 @@ fil_names_clear(
 		fil_names_write(space, &mtr);
 		do_write = true;
 
+		const mtr_buf_t* mtr_log = mtr_get_log(&mtr);
+
+		/** If the mtr buffer size exceeds the size of
+		LOG_CHECKPOINT_FREE_PER_THREAD then commit the multi record
+		mini-transaction, start the new mini-transaction to
+		avoid the parsing buffer overflow error during recovery. */
+
+		if (mtr_log->size() > mtr_checkpoint_size) {
+			ut_ad(mtr_log->size() < (RECV_PARSING_BUF_SIZE / 2));
+			mtr.commit_checkpoint(lsn, false);
+			mtr.start();
+		}
+
 		space = next;
 	}
 
 	if (do_write) {
-		mtr.commit_checkpoint(lsn);
+		mtr.commit_checkpoint(lsn, true);
 	} else {
 		ut_ad(!mtr.has_modifications());
 	}
@@ -7309,12 +7402,6 @@ fil_set_encryption(
 	byte*			key,
 	byte*			iv)
 {
-	ut_ad(!is_system_or_undo_tablespace(space_id));
-
-	if (is_system_tablespace(space_id)) {
-		return(DB_IO_NO_ENCRYPT_TABLESPACE);
-	}
-
 	mutex_enter(&fil_system->mutex);
 
 	fil_space_t*	space = fil_space_get_by_id(space_id);
@@ -7326,6 +7413,8 @@ fil_set_encryption(
 
 	ut_ad(algorithm != Encryption::NONE);
 	space->encryption_type = algorithm;
+	space->flags |= FSP_FLAGS_MASK_ENCRYPTION;
+
 	if (key == NULL) {
 		Encryption::random_value(space->encryption_key);
 	} else {
@@ -7346,41 +7435,103 @@ fil_set_encryption(
 	return(DB_SUCCESS);
 }
 
+/** Enable encryption of temporary tablespace
+@param[in,out]	space	tablespace object
+@return DB_SUCCESS on success, DB_ERROR on failure */
+dberr_t
+fil_temp_update_encryption(
+	fil_space_t*	space)
+{
+	/* Make sure the keyring is loaded. */
+	if (!Encryption::check_keyring()) {
+		ib::error() << "Can't set temporary tablespace"
+			<< " to be encrypted because"
+			<< " keyring plugin is not"
+			<< " available.";
+			return(DB_ERROR);
+	}
+
+	if (!fsp_enable_encryption(space)) {
+		ib::error() << "Can't set temporary tablespace"
+			<< " to be encrypted.";
+		return(DB_ERROR);
+	}
+
+	dberr_t	err = fil_set_encryption(
+		space->id,
+		Encryption::AES, NULL, NULL);
+
+	ut_ad(err == DB_SUCCESS);
+
+	return(err);
+}
+
+/** Default master key id for bootstrap */
+static const ulint ENCRYPTION_DEFAULT_MASTER_KEY_ID = 0;
+
+/** Rotate the tablespace key by new master key.
+@param[in]	space	tablespace object
+@return true if the re-encrypt suceeds */
+static
+bool
+fil_encryption_rotate_low(const fil_space_t* space)
+{
+	bool success = true;
+	if (space->encryption_type != Encryption::NONE) {
+		mtr_t mtr;
+		mtr_start(&mtr);
+
+		if (fsp_is_system_temporary(space->id)) {
+			mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
+		}
+
+		mtr.set_named_space(space->id);
+
+		fil_space_t* space_locked = mtr_x_lock_space(space->id, &mtr);
+
+		byte	encrypt_info[ENCRYPTION_INFO_SIZE_V2];
+		memset(encrypt_info, 0, ENCRYPTION_INFO_SIZE_V2);
+
+		if (!fsp_header_rotate_encryption(space_locked,
+						  encrypt_info,
+						  &mtr)) {
+			success = false;
+		}
+		mtr_commit(&mtr);
+	}
+	return(success);
+}
+
 /** Rotate the tablespace keys by new master key.
 @return true if the re-encrypt suceeds */
 bool
 fil_encryption_rotate()
 {
 	fil_space_t*	space;
-	mtr_t		mtr;
-	byte		encrypt_info[ENCRYPTION_INFO_SIZE_V2];
 
 	for (space = UT_LIST_GET_FIRST(fil_system->space_list);
 	     space != NULL; ) {
 		/* Skip unencypted tablespaces. */
-		if (is_system_or_undo_tablespace(space->id)
-		    || fsp_is_system_temporary(space->id)
+		if (srv_is_undo_tablespace(space->id)
 		    || space->purpose == FIL_TYPE_LOG) {
 			space = UT_LIST_GET_NEXT(space_list, space);
 			continue;
 		}
 
-		if (space->encryption_type != Encryption::NONE) {
-			mtr_start(&mtr);
-			mtr.set_named_space(space->id);
+		/* Skip the temporary tablespace when it's in default
+		key status, since it's the first server startup
+		after bootstrap, and the server uuid is not ready
+		yet. */
+		if (fsp_is_system_temporary(space->id)
+		    && Encryption::master_key_id ==
+			ENCRYPTION_DEFAULT_MASTER_KEY_ID) {
+			space = UT_LIST_GET_NEXT(space_list, space);
+			continue;
+		}
 
-			space = mtr_x_lock_space(space->id, &mtr);
-
-			memset(encrypt_info, 0, ENCRYPTION_INFO_SIZE_V2);
-
-			if (!fsp_header_rotate_encryption(space,
-							  encrypt_info,
-							  &mtr)) {
-				mtr_commit(&mtr);
-				return(false);
-			}
-
-			mtr_commit(&mtr);
+		bool success = fil_encryption_rotate_low(space);
+		if (!success) {
+			return(false);
 		}
 
 		space = UT_LIST_GET_NEXT(space_list, space);
@@ -7388,6 +7539,29 @@ fil_encryption_rotate()
 				DBUG_SUICIDE(););
 	}
 
+	return(true);
+}
+
+/** Rotate tablespace keys of global tablespaces like system, temporary, etc.
+This is used only at startup to fix the empty UUIDs.
+@param[in]	space_ids	vector of space_ids
+@return true on success, false on failure */
+bool
+fil_encryption_rotate_global(const space_id_vec& space_ids)
+{
+	space_id_vec::const_iterator it;
+	for (it = space_ids.begin(); it != space_ids.end(); ++it) {
+
+		fil_space_t* space = fil_space_acquire(*it);
+
+		bool success = fil_encryption_rotate_low(space);
+
+		fil_space_release(space);
+
+		if (!success) {
+			return(false);
+		}
+	}
 	return(true);
 }
 

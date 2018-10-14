@@ -2,7 +2,7 @@
 #define HANDLER_INCLUDED
 
 /*
-   Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or
    modify it under the terms of the GNU General Public License
@@ -70,6 +70,8 @@ typedef my_bool (*qc_engine_callback)(THD *thd, char *table_key,
 #define HA_ADMIN_NEEDS_CHECK    -12
 /** Needs ALTER TABLE t UPGRADE PARTITIONING. */
 #define HA_ADMIN_NEEDS_UPG_PART -13
+/** Needs to dump and re-create to fix pre 5.0 decimal types */
+#define HA_ADMIN_NEEDS_DUMP_UPGRADE -14
 
 /**
    Return values for check_if_supported_inplace_alter().
@@ -293,6 +295,12 @@ enum enum_alter_inplace_result {
   Supports index on virtual generated column
 */
 #define HA_CAN_INDEX_VIRTUAL_GENERATED_COLUMN (1LL << 47)
+
+/**
+  There is no need to evict the table from the table definition cache having
+  run ANALYZE TABLE on it
+ */
+#define HA_ONLINE_ANALYZE             (1LL << 48)
 
 /* bits in index_flags(index_number) for what you can do with index */
 #define HA_READ_NEXT            1       /* TODO really use this flag */
@@ -593,6 +601,8 @@ class st_alter_tablespace : public Sql_alloc
   bool wait_until_completed;
   const char *ts_comment;
   enum tablespace_access_mode ts_access_mode;
+  bool encrypt;
+  LEX_STRING encrypt_type;
   bool is_tablespace_command()
   {
     return ts_cmd_type == CREATE_TABLESPACE      ||
@@ -623,6 +633,8 @@ class st_alter_tablespace : public Sql_alloc
     wait_until_completed= TRUE;
     ts_comment= NULL;
     ts_access_mode= TS_NOT_DEFINED;
+    encrypt= false;
+    encrypt_type = LEX_STRING();
   }
 };
 
@@ -1049,6 +1061,17 @@ struct handlerton
   */
   bool (*rotate_encryption_master_key)(void);
 
+ /**
+    @brief
+    Fix empty UUID of tablespaces of an engine. This is used when engine encrypts
+    tablespaces as part of initialization. These tablespaces will have empty UUID
+    because UUID is generated after all plugins are initialized. This API will be
+    called by server only after UUID is available.
+    @returns false on success,
+             true on failure
+  */
+  bool (*fix_tablespaces_empty_uuid)(void);
+
   /**
     Creates a new compression dictionary with the specified data for this SE.
 
@@ -1138,6 +1161,14 @@ struct handlerton
 
 #define HTON_SUPPORTS_FOREIGN_KEYS   (1 << 13)
 
+/**
+  Engine supports compressed columns.
+*/
+#define HTON_SUPPORTS_COMPRESSED_COLUMNS (1 << 14)
+
+// Engine supports packed keys.
+#define HTON_SUPPORTS_PACKED_KEYS    (1 << 12)
+
 enum enum_tx_isolation { ISO_READ_UNCOMMITTED, ISO_READ_COMMITTED,
 			 ISO_REPEATABLE_READ, ISO_SERIALIZABLE};
 
@@ -1181,6 +1212,8 @@ enum enum_stats_auto_recalc { HA_STATS_AUTO_RECALC_DEFAULT= 0,
 
 typedef struct st_ha_create_information
 {
+  st_ha_create_information() { memset(this, 0, sizeof(*this)); }
+
   const CHARSET_INFO *table_charset, *default_table_charset;
   LEX_STRING connect_string;
   const char *password, *tablespace;
@@ -1445,6 +1478,14 @@ public:
 
   // New/changed virtual generated column require validation
   static const HA_ALTER_FLAGS VALIDATE_VIRTUAL_COLUMN    = 1ULL << 41;
+
+  /**
+    Change in index length such that it does not require index rebuild.
+    For example, change in index length due to column expansion like
+    varchar(X) changed to varchar(X + N).
+  */
+  static const HA_ALTER_FLAGS ALTER_COLUMN_INDEX_LENGTH = 1ULL << 42;
+
 
   /**
     Create options (like MAX_ROWS) for the new version of table.
@@ -2992,6 +3033,15 @@ public:
   */
   virtual bool has_gap_locks() const { return false; }
 
+  /**
+    Query storage engine to see if it can support handling specific replication
+    method in its current configuration.
+  */
+  virtual bool rpl_can_handle_stm_event() const
+  {
+    return true;
+  }
+
 protected:
   static bool is_using_full_key(key_part_map keypart_map, uint actual_key_parts);
   bool is_using_full_unique_key(uint active_index,
@@ -3027,6 +3077,7 @@ public:
                      enum_range_scan_direction direction);
   int compare_key(key_range *range);
   int compare_key_icp(const key_range *range) const;
+  int compare_key_in_buffer(const uchar *buf) const;
   virtual int ft_init() { return HA_ERR_WRONG_COMMAND; }
   void ft_end() { ft_handler=NULL; }
   virtual FT_INFO *ft_init_ext(uint flags, uint inx,String *key)
@@ -3050,9 +3101,18 @@ public:
   */
   virtual int rnd_pos_by_record(uchar *record)
     {
+      int error;
       DBUG_ASSERT(table_flags() & HA_PRIMARY_KEY_REQUIRED_FOR_POSITION);
+
+      error = ha_rnd_init(FALSE);
+      if (error != 0)
+            return error;
+
       position(record);
-      return ha_rnd_pos(record, ref);
+      error = ha_rnd_pos(record, ref);
+      ha_rnd_end();
+      return error;
+
     }
   virtual int read_first_row(uchar *buf, uint primary_key);
   virtual ha_rows records_in_range(uint inx, key_range *min_key, key_range *max_key)
@@ -3134,7 +3194,16 @@ public:
       insert_id_for_cur_row;
   }
 
+  /*
+     This function allows the storage engine to adust the create_info before
+     the frm is written based on it.
+     This can be used for example to modify the create statement based on a
+     storage engine specific setting.
+   */
+  virtual void adjust_create_info_for_frm(HA_CREATE_INFO *create_info) {}
+
   virtual void update_create_info(HA_CREATE_INFO *create_info) {}
+
   int check_old_types();
   virtual int assign_to_keycache(THD* thd, HA_CHECK_OPT* check_opt)
   { return HA_ADMIN_NOT_IMPLEMENTED; }
@@ -3251,16 +3320,18 @@ public:
   {
     return std::min(MAX_KEY_LENGTH, max_supported_key_length());
   }
-  uint max_key_part_length() const
+  uint max_key_part_length(HA_CREATE_INFO *create_info) const
   {
-    return std::min(MAX_KEY_LENGTH, max_supported_key_part_length());
+    return std::min(MAX_KEY_LENGTH, max_supported_key_part_length(create_info));
   }
 
   virtual uint max_supported_record_length() const { return HA_MAX_REC_LENGTH; }
   virtual uint max_supported_keys() const { return 0; }
   virtual uint max_supported_key_parts() const { return MAX_REF_PARTS; }
   virtual uint max_supported_key_length() const { return MAX_KEY_LENGTH; }
-  virtual uint max_supported_key_part_length() const { return 255; }
+  virtual uint max_supported_key_part_length(HA_CREATE_INFO
+                            *create_info MY_ATTRIBUTE((unused))) const
+  { return 255; }
   virtual uint min_record_length(uint options) const { return 1; }
 
   virtual bool low_byte_first() const { return 1; }
@@ -3729,7 +3800,70 @@ protected:
 public:
  /* End of On-line/in-place ALTER TABLE interface. */
 
+  /**
+    @brief Offload an update to the storage engine. See handler::fast_update()
+    for details.
+  */
+  MY_NODISCARD int ha_fast_update(THD *thd,
+                                  List<Item> &update_fields,
+                                  List<Item> &update_values,
+                                  Item *conds);
 
+  /**
+    @brief Offload an upsert to the storage engine. See handler::upsert()
+    for details.
+  */
+  MY_NODISCARD int ha_upsert(THD *thd,
+                             List<Item> &update_fields,
+                             List<Item> &update_values);
+private:
+  /**
+    Offload an update to the storage engine implementation.
+
+    @param    thd              The thread handle.
+    @param    update_fields    The list of fields to update.
+    @param    update_values    The list of new values for the fields
+                               in update_fields.
+    @param    conds            Conditions tree.
+
+    @retval   0                if the storage engine handled the update.
+    @retval   ENOTSUP          if the storage engine can not handle the
+                               update and the slow update code path should
+                               continue executing the update.
+
+    @return an error if the update should be terminated.
+
+    @note HA_READ_BEFORE_WRITE_REMOVAL flag doesn not fit there because
+    handler::ha_update_row(...) does not accept conditions.
+  */
+  MY_NODISCARD virtual int fast_update(THD *thd,
+                                       List<Item> &update_fields,
+                                       List<Item> &update_values,
+                                       Item *conds)
+  { return ENOTSUP; }
+
+  /**
+    Offload an upsert to the storage engine implementation. Expects the row
+    to be stored in record[0].
+
+    @param    thd              The thread handle.
+    @param    update_fields    The list of fields to update.
+    @param    update_values    The list of new values for the fields
+                               in update_fields.
+
+    @retval   0                if the storage engine handled the upsert.
+    @retval   ENOTSUP          if the storage engine can not handle the upsert
+                               and the slow insert code path should continue
+                               executing the insert.
+
+    @return an error if the insert should be terminated.
+  */
+  MY_NODISCARD virtual int upsert(THD *thd,
+                                  List<Item> &update_fields,
+                                  List<Item> &update_values)
+  { return ENOTSUP; }
+
+public:
   /**
     use_hidden_primary_key() is called in case of an update/delete when
     (table_flags() and HA_PRIMARY_KEY_REQUIRED_FOR_DELETE) is defined
@@ -3978,8 +4112,13 @@ public:
     compression dictionary info (name and data).
     If the handler does not support compression dictionaries
     this method should be left empty (not overloaded).
+
+    @param    thd          Thread handle
+    @param    part_name    Full table name (including partition part).
+                           Optional.
   */
-  virtual void update_field_defs_with_zip_dict_info(THD* thd) { }
+  virtual void update_field_defs_with_zip_dict_info(THD* thd,
+                                                    const char* part_name) {}
 
 public:
   /* Read-free replication interface */
@@ -4267,8 +4406,10 @@ int ha_discover(THD* thd, const char* dbname, const char* name,
 int ha_find_files(THD *thd,const char *db,const char *path,
                   const char *wild, bool dir, List<LEX_STRING>* files);
 int ha_table_exists_in_engine(THD* thd, const char* db, const char* name);
-bool ha_check_if_supported_system_table(handlerton *hton, const char* db, 
-                                        const char* table_name);
+bool ha_is_supported_system_table(handlerton *hton, const char *db,
+                                  const char *table_name);
+bool ha_is_valid_system_or_user_table(handlerton *hton, const char *db,
+                                      const char *table_name);
 
 /* key cache */
 extern "C" int ha_init_key_cache(const char *name, KEY_CACHE *key_cache);
@@ -4376,5 +4517,8 @@ bool ha_notify_alter_table(THD *thd, const MDL_key *mdl_key,
 
 int commit_owned_gtids(THD *thd, bool all, bool *need_clear_ptr);
 int commit_owned_gtid_by_partial_command(THD *thd);
+bool set_tx_isolation(THD *thd,
+                      enum_tx_isolation tx_isolation,
+                      bool one_shot);
 
 #endif /* HANDLER_INCLUDED */

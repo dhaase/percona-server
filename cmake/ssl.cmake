@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2016, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2017, Oracle and/or its affiliates. All rights reserved.
 # 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -58,6 +58,8 @@ MACRO (MYSQL_USE_BUNDLED_SSL)
   SET(SSL_INCLUDE_DIRS ${INC_DIRS})
   SET(SSL_INTERNAL_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/extra/yassl/taocrypt/mySTL)
   SET(SSL_DEFINES "-DHAVE_YASSL -DYASSL_PREFIX -DHAVE_OPENSSL -DMULTI_THREADED")
+  SET(HAVE_X509_CHECK_HOST OFF CACHE INTERNAL "yassl doesn't support HAVE_X509_check_host")
+  SET(HAVE_X509_CHECK_IP OFF CACHE INTERNAL "yassl doesn't support HAVE_X509_check_ip")
   CHANGE_SSL_SETTINGS("bundled")
   ADD_SUBDIRECTORY(extra/yassl)
   ADD_SUBDIRECTORY(extra/yassl/taocrypt)
@@ -87,6 +89,7 @@ MACRO (MYSQL_CHECK_SSL)
   FILE(GLOB WITH_SSL_HEADER ${WITH_SSL}/include/openssl/ssl.h)
   IF (WITH_SSL_HEADER)
     SET(WITH_SSL_PATH ${WITH_SSL} CACHE PATH "path to custom SSL installation")
+    SET(WITH_SSL_PATH ${WITH_SSL})
   ENDIF()
 
   IF(WITH_SSL STREQUAL "bundled")
@@ -186,7 +189,7 @@ MACRO (MYSQL_CHECK_SSL)
     # and we have found static libraries, then link them statically
     # into our executables and libraries.
     # Adding IMPORTED_LOCATION allows MERGE_STATIC_LIBS
-    # to get LOCATION and do correct dependency analysis.
+    # to merge imported libraries as well as our own libraries.
     SET(MY_CRYPTO_LIBRARY "${CRYPTO_LIBRARY}")
     SET(MY_OPENSSL_LIBRARY "${OPENSSL_LIBRARY}")
     IF (WITH_SSL_PATH)
@@ -194,15 +197,11 @@ MACRO (MYSQL_CHECK_SSL)
       GET_FILENAME_COMPONENT(OPENSSL_EXT "${OPENSSL_LIBRARY}" EXT)
       IF (CRYPTO_EXT STREQUAL ".a" OR OPENSSL_EXT STREQUAL ".lib")
         SET(MY_CRYPTO_LIBRARY imported_crypto)
-        ADD_LIBRARY(imported_crypto STATIC IMPORTED)
-        SET_TARGET_PROPERTIES(imported_crypto
-          PROPERTIES IMPORTED_LOCATION "${CRYPTO_LIBRARY}")
+        ADD_IMPORTED_LIBRARY(imported_crypto "${CRYPTO_LIBRARY}")
       ENDIF()
       IF (OPENSSL_EXT STREQUAL ".a" OR OPENSSL_EXT STREQUAL ".lib")
         SET(MY_OPENSSL_LIBRARY imported_openssl)
-        ADD_LIBRARY(imported_openssl STATIC IMPORTED)
-        SET_TARGET_PROPERTIES(imported_openssl
-          PROPERTIES IMPORTED_LOCATION "${OPENSSL_LIBRARY}")
+        ADD_IMPORTED_LIBRARY(imported_openssl "${OPENSSL_LIBRARY}")
       ENDIF()
     ENDIF()
 
@@ -228,6 +227,13 @@ MACRO (MYSQL_CHECK_SSL)
       SET(SSL_INCLUDE_DIRS ${OPENSSL_INCLUDE_DIR})
       SET(SSL_INTERNAL_INCLUDE_DIRS "")
       SET(SSL_DEFINES "-DHAVE_OPENSSL")
+      INCLUDE(CMakePushCheckState)
+      cmake_push_check_state()
+      SET(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
+      SET(CMAKE_REQUIRED_LIBRARIES ${MY_OPENSSL_LIBRARY} ${MY_CRYPTO_LIBRARY})
+      CHECK_SYMBOL_EXISTS(X509_check_host "openssl/x509v3.h" HAVE_X509_CHECK_HOST)
+      CHECK_SYMBOL_EXISTS(X509_check_ip "openssl/x509v3.h" HAVE_X509_CHECK_IP)
+      cmake_pop_check_state()
     ELSE()
 
       UNSET(WITH_SSL_PATH)
@@ -268,7 +274,9 @@ MACRO (COPY_OPENSSL_DLLS target_name)
     GET_FILENAME_COMPONENT(OPENSSL_NAME "${OPENSSL_LIBRARY}" NAME_WE)
     FILE(GLOB HAVE_CRYPTO_DLL "${WITH_SSL_PATH}/bin/${CRYPTO_NAME}.dll")
     FILE(GLOB HAVE_OPENSSL_DLL "${WITH_SSL_PATH}/bin/${OPENSSL_NAME}.dll")
-    IF (HAVE_CRYPTO_DLL AND HAVE_OPENSSL_DLL)
+    MESSAGE(STATUS "HAVE_CRYPTO_DLL ${HAVE_CRYPTO_DLL}")
+    MESSAGE(STATUS "HAVE_OPENSSL_DLL ${HAVE_OPENSSL_DLL}")
+    IF(HAVE_CRYPTO_DLL AND HAVE_OPENSSL_DLL)
       ADD_CUSTOM_COMMAND(OUTPUT ${target_name}
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${WITH_SSL_PATH}/bin/${CRYPTO_NAME}.dll"

@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2008, 2017, Oracle and/or its affiliates. All rights reserved.
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -57,6 +57,8 @@
 #include "pfs_digest.h"
 #include "pfs_program.h"
 #include "pfs_prepared_stmt.h"
+
+using std::min;
 
 /*
   This is a development tool to investigate memory statistics,
@@ -2379,8 +2381,8 @@ void pfs_set_thread_account_v1(const char *user, int user_len,
   DBUG_ASSERT((uint) user_len <= sizeof(pfs->m_username));
   DBUG_ASSERT((host != NULL) || (host_len == 0));
   DBUG_ASSERT(host_len >= 0);
-  DBUG_ASSERT((uint) host_len <= sizeof(pfs->m_hostname));
 
+  host_len= min<size_t>(host_len, sizeof(pfs->m_hostname));
   if (unlikely(pfs == NULL))
     return;
 
@@ -4414,9 +4416,11 @@ pfs_end_file_open_wait_v1(PSI_file_locker *locker,
   switch (state->m_operation)
   {
   case PSI_FILE_STAT:
+  case PSI_FILE_RENAME:
     break;
   case PSI_FILE_STREAM_OPEN:
   case PSI_FILE_CREATE:
+  case PSI_FILE_OPEN:
     if (result != NULL)
     {
       PFS_file_class *klass= reinterpret_cast<PFS_file_class*> (state->m_class);
@@ -4427,7 +4431,6 @@ pfs_end_file_open_wait_v1(PSI_file_locker *locker,
       state->m_file= reinterpret_cast<PSI_file*> (pfs_file);
     }
     break;
-  case PSI_FILE_OPEN:
   default:
     DBUG_ASSERT(false);
     break;
@@ -4732,6 +4735,31 @@ void pfs_end_file_close_wait_v1(PSI_file_locker *locker, int rc)
       break;
     }
   }
+  return;
+}
+
+/**
+  Implementation of the file instrumentation interface.
+  @sa PSI_v1::end_file_rename_wait.
+*/
+void pfs_end_file_rename_wait_v1(PSI_file_locker *locker, const char *old_name,
+                                 const char *new_name, int rc)
+{
+  PSI_file_locker_state *state= reinterpret_cast<PSI_file_locker_state*> (locker);
+  DBUG_ASSERT(state != NULL);
+  DBUG_ASSERT(state->m_operation == PSI_FILE_RENAME);
+
+  if (rc == 0)
+  {
+    PFS_thread *thread= reinterpret_cast<PFS_thread *> (state->m_thread);
+
+    uint old_len= (uint)strlen(old_name);
+    uint new_len= (uint)strlen(new_name);
+
+    find_and_rename_file(thread, old_name, old_len, new_name, new_len);
+  }
+
+  pfs_end_file_wait_v1(locker, 0);
   return;
 }
 
@@ -6386,6 +6414,26 @@ void pfs_reprepare_prepared_stmt_v1(PSI_prepared_stmt* prepared_stmt)
   return;
 }
 
+void pfs_set_prepared_stmt_text_v1(PSI_prepared_stmt *prepared_stmt,
+                                   const char *text,
+                                   uint text_len)
+{
+  PFS_prepared_stmt *pfs_prepared_stmt =
+    reinterpret_cast<PFS_prepared_stmt *>(prepared_stmt);
+  DBUG_ASSERT(pfs_prepared_stmt != NULL);
+
+  uint max_len = COL_INFO_SIZE;
+  if (text_len > max_len)
+  {
+    text_len = max_len;
+  }
+
+  memcpy(pfs_prepared_stmt->m_sqltext, text, text_len);
+  pfs_prepared_stmt->m_sqltext_length = text_len;
+
+  return;
+}
+
 /**
   Implementation of the thread attribute connection interface
   @sa PSI_v1::set_thread_connect_attr.
@@ -7003,6 +7051,7 @@ PSI_v1 PFS_v1=
   pfs_end_file_wait_v1,
   pfs_start_file_close_wait_v1,
   pfs_end_file_close_wait_v1,
+  pfs_end_file_rename_wait_v1,
   pfs_start_stage_v1,
   pfs_get_current_stage_progress_v1,
   pfs_end_stage_v1,
@@ -7046,6 +7095,7 @@ PSI_v1 PFS_v1=
   pfs_destroy_prepared_stmt_v1,
   pfs_reprepare_prepared_stmt_v1,
   pfs_execute_prepared_stmt_v1,
+  pfs_set_prepared_stmt_text_v1,
   pfs_digest_start_v1,
   pfs_digest_end_v1,
   pfs_set_thread_connect_attrs_v1,

@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -1227,6 +1227,7 @@ static bool execute_ddl_log_action(THD *thd, DDL_LOG_ENTRY *ddl_log_entry)
         action in the log entry by stepping up the phase.
       */
     }
+    // Fall through
     case DDL_LOG_RENAME_ACTION:
     {
       error= TRUE;
@@ -2121,8 +2122,15 @@ bool mysql_rm_table(THD *thd,TABLE_LIST *tables, my_bool if_exists,
       Here we are sure that the tmp table exists and will set the flag based on
       table transactional type.
     */
-    if (is_temporary_table(table))
+    if (is_temporary_table(table) && table->table->should_binlog_drop_if_temp()
+        && drop_temporary
+        && (thd->in_multi_stmt_transaction_mode() || thd->in_sub_stmt))
     {
+      const bool ret= handle_gtid_consistency_violation(
+        thd, ER_GTID_UNSAFE_CREATE_DROP_TEMPORARY_TABLE_IN_TRANSACTION);
+      if (!ret)
+        DBUG_RETURN(true);
+
       if (table->table->s->tmp_table == TRANSACTIONAL_TMP_TABLE)
         have_trans_tmp_table= 1;
       else if (table->table->s->tmp_table == NON_TRANSACTIONAL_TMP_TABLE)
@@ -2353,13 +2361,16 @@ int mysql_rm_table_no_locks(THD *thd, TABLE_LIST *tables, bool if_exists,
   int non_temp_tables_count= 0;
   bool foreign_key_error=0;
   bool non_tmp_error= 0;
-  bool trans_tmp_table_deleted= 0, non_trans_tmp_table_deleted= 0;
+  bool trans_tmp_table_delete_to_binlog= false;
+  bool non_trans_tmp_table_delete_to_binlog= false;
   bool non_tmp_table_deleted= 0;
-  bool have_nonexistent_tmp_table= 0;
-  bool is_drop_tmp_if_exists_with_no_defaultdb= 0;
+  bool nonexistent_tmp_table_to_binlog= false;
+  bool is_drop_tmp_with_no_defaultdb= false;
   String built_query;
   String built_trans_tmp_query, built_non_trans_tmp_query;
   String nonexistent_tmp_tables;
+  bool tmp_table_deleted= false;
+  bool tmp_table_not_found= false;
   DBUG_ENTER("mysql_rm_table_no_locks");
 
   if (thd_sql_command(thd) == SQLCOM_DROP_DB
@@ -2415,16 +2426,18 @@ int mysql_rm_table_no_locks(THD *thd, TABLE_LIST *tables, bool if_exists,
         built_query.append("DROP TABLE ");
     }
 
-    if (thd->is_current_stmt_binlog_format_row() || if_exists)
+    /*
+      If default database doesnot exist in those cases set
+      'is_drop_tmp_with_no_defaultdb flag to 'true' so that the
+      'DROP TEMPORARY TABLE IF EXISTS' command is logged with a qualified
+      table name.
+    */
+    is_drop_tmp_with_no_defaultdb=
+      (thd->is_current_stmt_binlog_format_row() && thd->db().str != NULL
+       && check_db_dir_existence(thd->db().str));
+
+    if (if_exists)
     {
-      /*
-        If default database doesnot exist in those cases set
-        'is_drop_tmp_if_exists_with_no_defaultdb flag to 'true' so that the
-        'DROP TEMPORARY TABLE IF EXISTS' command is logged with a qualified
-        table name.
-      */
-      if (thd->db().str != NULL && check_db_dir_existence(thd->db().str))
-        is_drop_tmp_if_exists_with_no_defaultdb= true;
       built_trans_tmp_query.set_charset(system_charset_info);
       built_trans_tmp_query.append("DROP TEMPORARY TABLE IF EXISTS ");
       built_non_trans_tmp_query.set_charset(system_charset_info);
@@ -2464,6 +2477,9 @@ int mysql_rm_table_no_locks(THD *thd, TABLE_LIST *tables, bool if_exists,
 
     thd->add_to_binlog_accessed_dbs(table->db);
 
+    // Save this before drop_temporary_table resets table->table to NULL
+    const bool should_binlog_drop_if_temp=
+      is_temporary_table(table) && table->table->should_binlog_drop_if_temp();
     /*
       drop_temporary_table may return one of the following error codes:
       .  0 - a temporary table was successfully dropped.
@@ -2492,36 +2508,50 @@ int mysql_rm_table_no_locks(THD *thd, TABLE_LIST *tables, bool if_exists,
       */
       if (!dont_log_query)
       {
-        /*
-          If there is an error, we don't know the type of the engine
-          at this point. So, we keep it in the nonexistent_tmp_table list.
-        */
         if (error == 1)
-          have_nonexistent_tmp_table= true;
-        else if (is_trans)
-          trans_tmp_table_deleted= TRUE;
+          tmp_table_not_found= true;
         else
-          non_trans_tmp_table_deleted= TRUE;
+          tmp_table_deleted= true;
 
-        String *built_ptr_query=
-          (error == 1 ? &nonexistent_tmp_tables :
-           (is_trans ? &built_trans_tmp_query : &built_non_trans_tmp_query));
-        /*
-          Write the database name if it is not the current one or if
-          thd->db is NULL or 'IF EXISTS' clause is present in 'DROP TEMPORARY'
-          query.
-        */
-        if (thd->db().str == NULL || strcmp(db, thd->db().str) != 0
-            || is_drop_tmp_if_exists_with_no_defaultdb )
+        if (should_binlog_drop_if_temp)
         {
-          append_identifier(thd, built_ptr_query, db, db_len,
-                            system_charset_info, thd->charset());
-          built_ptr_query->append(".");
+          String *built_ptr_query;
+          if (error == 1)
+          {
+            /*
+              If there is an error, we don't know the type of the engine
+              at this point. So, we keep it in the nonexistent_tmp_table list.
+            */
+            built_ptr_query= &nonexistent_tmp_tables;
+            nonexistent_tmp_table_to_binlog= true;
+          }
+          else if (is_trans)
+          {
+            built_ptr_query= &built_trans_tmp_query;
+            trans_tmp_table_delete_to_binlog= true;
+          }
+          else
+          {
+            built_ptr_query= &built_non_trans_tmp_query;
+            non_trans_tmp_table_delete_to_binlog= true;
+          }
+          /*
+            Write the database name if it is not the current one or if
+            thd->db is NULL or 'IF EXISTS' clause is present in 'DROP
+            TEMPORARY' query.
+          */
+          if (thd->db().str == NULL || strcmp(db, thd->db().str) != 0
+              || is_drop_tmp_with_no_defaultdb)
+          {
+            append_identifier(thd, built_ptr_query, db, db_len,
+                              system_charset_info, thd->charset());
+            built_ptr_query->append(".");
+          }
+          append_identifier(thd, built_ptr_query, table->table_name,
+                            strlen(table->table_name), system_charset_info,
+                            thd->charset());
+          built_ptr_query->append(",");
         }
-        append_identifier(thd, built_ptr_query, table->table_name,
-                           strlen(table->table_name), system_charset_info,
-                           thd->charset());
-        built_ptr_query->append(",");
       }
       /*
         This means that a temporary table was droped and as such there
@@ -2709,8 +2739,7 @@ int mysql_rm_table_no_locks(THD *thd, TABLE_LIST *tables, bool if_exists,
 #endif
   }
   DEBUG_SYNC(thd, "rm_table_no_locks_before_binlog");
-  thd->thread_specific_used|= (trans_tmp_table_deleted ||
-                               non_trans_tmp_table_deleted);
+  thd->thread_specific_used= thd->thread_specific_used || tmp_table_deleted;
   error= 0;
 err:
   if (wrong_tables.length())
@@ -2723,11 +2752,9 @@ err:
     error= 1;
   }
 
-  if (have_nonexistent_tmp_table || non_trans_tmp_table_deleted ||
-      trans_tmp_table_deleted || non_tmp_table_deleted)
+  if (tmp_table_deleted || tmp_table_not_found || non_tmp_table_deleted)
   {
-    if (have_nonexistent_tmp_table || non_trans_tmp_table_deleted ||
-        trans_tmp_table_deleted)
+    if (tmp_table_deleted || tmp_table_not_found)
       thd->get_transaction()->mark_dropped_temp_table(Transaction_ctx::STMT);
 
     /*
@@ -2757,13 +2784,14 @@ err:
     */
     if (!dont_log_query && mysql_bin_log.is_open())
     {
-      if (non_trans_tmp_table_deleted)
+      if (non_trans_tmp_table_delete_to_binlog)
       {
         /*
           Add the list of nonexistent tmp tables here only if there is no
           trans tmp table deleted.
         */
-        if (!trans_tmp_table_deleted && have_nonexistent_tmp_table)
+        if (!trans_tmp_table_delete_to_binlog
+            && nonexistent_tmp_table_to_binlog)
           built_non_trans_tmp_query.append(nonexistent_tmp_tables);
         /* Chop off the last comma */
         built_non_trans_tmp_query.chop();
@@ -2772,11 +2800,12 @@ err:
                                    built_non_trans_tmp_query.ptr(),
                                    built_non_trans_tmp_query.length(),
                                    false/*is_trans*/, false/*direct*/,
-                                   is_drop_tmp_if_exists_with_no_defaultdb/*suppress_use*/,
+                                   is_drop_tmp_with_no_defaultdb/*suppress_use*/,
                                    0)/*errcode*/;
       }
-      if (trans_tmp_table_deleted ||
-          (have_nonexistent_tmp_table && !non_trans_tmp_table_deleted))
+      if (trans_tmp_table_delete_to_binlog ||
+          (nonexistent_tmp_table_to_binlog
+           && !non_trans_tmp_table_delete_to_binlog))
       {
         /*
           When multiple tables are dropped, the tables are classified
@@ -2818,14 +2847,14 @@ err:
             (non_tmp_table_deleted)'.
         */
         if (!thd->in_active_multi_stmt_transaction() &&
-            non_trans_tmp_table_deleted)
+            non_trans_tmp_table_delete_to_binlog)
         {
           DBUG_PRINT("info", ("mysql_rm_table_no_locks commit point 1"));
           thd->is_commit_in_middle_of_statement= true;
           error |= mysql_bin_log.commit(thd, true);
           thd->is_commit_in_middle_of_statement= false;
         }
-        if (have_nonexistent_tmp_table)
+        if (nonexistent_tmp_table_to_binlog)
           built_trans_tmp_query.append(nonexistent_tmp_tables);
         /* Chop off the last comma */
         built_trans_tmp_query.chop();
@@ -2834,7 +2863,7 @@ err:
                                    built_trans_tmp_query.ptr(),
                                    built_trans_tmp_query.length(),
                                    true/*is_trans*/, false/*direct*/,
-                                   is_drop_tmp_if_exists_with_no_defaultdb/*suppress_use*/,
+                                   is_drop_tmp_with_no_defaultdb/*suppress_use*/,
                                    0/*errcode*/);
       }
       /*
@@ -2846,8 +2875,9 @@ err:
           (thd->lex->select_lex->table_list.elements > 1 || !error))
       {
         /// @see comment for mysql_bin_log.commit above.
-        if (non_trans_tmp_table_deleted || trans_tmp_table_deleted ||
-            have_nonexistent_tmp_table)
+        if (non_trans_tmp_table_delete_to_binlog
+            || trans_tmp_table_delete_to_binlog
+            || nonexistent_tmp_table_to_binlog)
         {
           DBUG_PRINT("info", ("mysql_rm_table_no_locks commit point 1"));
           thd->is_commit_in_middle_of_statement= true;
@@ -3597,6 +3627,21 @@ mysql_prepare_create_table(THD *thd, const char *error_schema_name,
   List_iterator<Create_field> it2(alter_info->create_list);
   uint total_uneven_bit_length= 0;
   DBUG_ENTER("mysql_prepare_create_table");
+
+  LEX_STRING* connect_string = &create_info->connect_string;
+  if (connect_string->length != 0 &&
+      connect_string->length > CONNECT_STRING_MAXLEN &&
+      (system_charset_info->cset->charpos(system_charset_info,
+                                          connect_string->str,
+                                          (connect_string->str +
+                                           connect_string->length),
+                                          CONNECT_STRING_MAXLEN)
+      < connect_string->length))
+  {
+    my_error(ER_WRONG_STRING_LENGTH, MYF(0),
+             connect_string->str, "CONNECTION", CONNECT_STRING_MAXLEN);
+    DBUG_RETURN(TRUE);
+  }
 
   select_field_pos= alter_info->create_list.elements - select_field_count;
   null_fields=blob_columns=0;
@@ -4518,10 +4563,11 @@ mysql_prepare_create_table(THD *thd, const char *error_schema_name,
           size_t max_field_size= blob_length_by_type(sql_field->sql_type);
 	  if (key_part_length > max_field_size ||
               key_part_length > max_key_length ||
-	      key_part_length > file->max_key_part_length())
+	      key_part_length > file->max_key_part_length(create_info))
 	  {
             // Given prefix length is too large, adjust it.
-	    key_part_length= min(max_key_length, file->max_key_part_length());
+	    key_part_length= min(max_key_length,
+                                 file->max_key_part_length(create_info));
 	    if (max_field_size)
               key_part_length= min(key_part_length, max_field_size);
 	    if (key->type & KEYTYPE_MULTIPLE)
@@ -4572,10 +4618,10 @@ mysql_prepare_create_table(THD *thd, const char *error_schema_name,
 	my_error(ER_WRONG_KEY_COLUMN, MYF(0), column->field_name.str);
 	  DBUG_RETURN(TRUE);
       }
-      if (key_part_length > file->max_key_part_length() &&
+      if (key_part_length > file->max_key_part_length(create_info) &&
           key->type != KEYTYPE_FULLTEXT)
       {
-        key_part_length= file->max_key_part_length();
+        key_part_length= file->max_key_part_length(create_info);
 	if (key->type & KEYTYPE_MULTIPLE)
 	{
 	  /* not a critical problem */
@@ -4599,7 +4645,8 @@ mysql_prepare_create_table(THD *thd, const char *error_schema_name,
       }
       key_part_info->length= (uint16) key_part_length;
       /* Use packed keys for long strings on the first column */
-      if (!((*db_options) & HA_OPTION_NO_PACK_KEYS) &&
+      if ((create_info->db_type->flags & HTON_SUPPORTS_PACKED_KEYS) &&
+          !((*db_options) & HA_OPTION_NO_PACK_KEYS) &&
           !((create_info->table_options & HA_OPTION_NO_PACK_KEYS)) &&
 	  (key_part_length >= KEY_DEFAULT_PACK_LENGTH &&
 	   (sql_field->sql_type == MYSQL_TYPE_STRING ||
@@ -4668,7 +4715,8 @@ mysql_prepare_create_table(THD *thd, const char *error_schema_name,
     if (key_length > max_key_length && key->type != KEYTYPE_FULLTEXT)
     {
       my_error(ER_TOO_LONG_KEY,MYF(0),max_key_length);
-      DBUG_RETURN(TRUE);
+      if (thd->is_error())  // May be silenced - see Bug#20629014
+        DBUG_RETURN(true);
     }
     if (validate_comment_length(thd, key->key_create_info.comment.str,
                                 &key->key_create_info.comment.length,
@@ -5049,6 +5097,10 @@ bool create_table_impl(THD *thd,
   uint		db_options;
   handler	*file;
   bool		error= TRUE;
+  bool		is_whitelisted_table;
+  bool		prepare_error;
+  Key_length_error_handler error_handler;
+
   DBUG_ENTER("create_table_impl");
   DBUG_PRINT("enter", ("db: '%s'  table: '%s'  tmp: %d",
                        db, table_name, internal_tmp_table));
@@ -5062,17 +5114,52 @@ bool create_table_impl(THD *thd,
     DBUG_RETURN(TRUE);
   }
 
+  if (check_engine(thd, db, table_name, create_info, alter_info))
+    DBUG_RETURN(TRUE);
+
   // Check if new table creation is disallowed by the storage engine.
   if (!internal_tmp_table &&
       ha_is_storage_engine_disabled(create_info->db_type))
   {
-    my_error(ER_DISABLED_STORAGE_ENGINE, MYF(0),
-              ha_resolve_storage_engine_name(create_info->db_type));
-    DBUG_RETURN(true);
-  }
+    /*
+      If table creation is disabled for the engine then substitute the engine
+      for the table with the default engine only if sql mode
+      NO_ENGINE_SUBSTITUTION is disabled.
+    */
+    handlerton *new_engine= NULL;
+    if (is_engine_substitution_allowed(thd))
+      new_engine= ha_default_handlerton(thd);
 
-  if (check_engine(thd, db, table_name, create_info, alter_info))
-    DBUG_RETURN(TRUE);
+    /*
+      Proceed with the engine substitution only if,
+      1. The disabled engine and the default engine are not the same.
+      2. The default engine is not in the disabled engines list.
+      else report an error.
+    */
+    if (new_engine && create_info->db_type &&
+        new_engine != create_info->db_type &&
+        !ha_is_storage_engine_disabled(new_engine))
+    {
+      push_warning_printf(thd, Sql_condition::SL_WARNING,
+                          ER_DISABLED_STORAGE_ENGINE,
+                          ER(ER_DISABLED_STORAGE_ENGINE),
+                          ha_resolve_storage_engine_name(create_info->db_type));
+
+      create_info->db_type= new_engine;
+
+      push_warning_printf(thd, Sql_condition::SL_WARNING,
+                          ER_WARN_USING_OTHER_HANDLER,
+                          ER(ER_WARN_USING_OTHER_HANDLER),
+                          ha_resolve_storage_engine_name(create_info->db_type),
+                          table_name);
+    }
+    else
+    {
+      my_error(ER_DISABLED_STORAGE_ENGINE, MYF(0),
+               ha_resolve_storage_engine_name(create_info->db_type));
+      DBUG_RETURN(true);
+    }
+  }
 
   set_table_default_charset(thd, create_info, (char*) db);
 
@@ -5329,15 +5416,40 @@ bool create_table_impl(THD *thd,
         }
       }
     }
+    if (alter_info->has_compressed_columns() &&
+      !ha_check_storage_engine_flag(part_info->default_engine_type,
+        HTON_SUPPORTS_COMPRESSED_COLUMNS))
+    {
+      my_error(ER_ILLEGAL_HA_CREATE_OPTION, MYF(0),
+        ha_resolve_storage_engine_name(part_info->default_engine_type),
+        "COMPRESSED COLUMNS");
+      goto err;
+    }
+
   }
 
-  if (mysql_prepare_create_table(thd, db, error_table_name,
-                                 create_info, alter_info,
-                                 internal_tmp_table,
-                                 &db_options, file,
-                                 key_info, key_count,
-                                 select_field_count))
-    goto err;
+  /*
+    System tables residing in mysql database and created
+    by innodb engine could be created with any supported
+    innodb page size ( 4k,8k,16K).  We have a index size
+    limit depending upon the page size, but for system
+    tables which are whitelisted we can skip this check,
+    since the innodb engine ensures that the index size
+    will be supported.
+  */
+  is_whitelisted_table = (file->ht->db_type == DB_TYPE_INNODB) ?
+    ha_is_supported_system_table(file->ht, db, error_table_name) : false;
+  if (is_whitelisted_table) thd->push_internal_handler(&error_handler);
+
+  prepare_error= mysql_prepare_create_table(thd, db, error_table_name,
+					    create_info, alter_info,
+					    internal_tmp_table,
+					    &db_options, file,
+					    key_info, key_count,
+					    select_field_count);
+
+  if (is_whitelisted_table) thd->pop_internal_handler();
+  if (prepare_error) goto err;
 
   if (create_info->options & HA_LEX_CREATE_TMP_TABLE)
     create_info->table_options|=HA_CREATE_DELAY_KEY_WRITE;
@@ -5962,7 +6074,6 @@ bool mysql_create_like_table(THD* thd, TABLE_LIST* table, TABLE_LIST* src_table,
   }
 
   /* Fill HA_CREATE_INFO and Alter_info with description of source table. */
-  memset(&local_create_info, 0, sizeof(local_create_info));
   local_create_info.db_type= src_table->table->s->db_type();
   local_create_info.row_type= src_table->table->s->row_type;
   if (mysql_prepare_alter_table(thd, src_table->table, &local_create_info,
@@ -6460,17 +6571,29 @@ static bool has_index_def_changed(Alter_inplace_info *ha_alter_info,
        key_part < end;
        key_part++, new_part++)
   {
-    /*
-      Key definition has changed if we are using a different field or
-      if the used key part length is different. It makes sense to
-      check lengths first as in case when fields differ it is likely
-      that lengths differ too and checking fields is more expensive
-      in general case.
-    */
-    if (key_part->length != new_part->length)
-      return true;
 
     new_field= get_field_by_index(alter_info, new_part->fieldnr);
+
+    /*
+      If there is a change in index length due to column expansion
+      like varchar(X) changed to varchar(X + N) and has a compatible
+      packed data representation, we mark it for fast/INPLACE change
+      in index definition. Some engines like InnoDB supports INPLACE
+      alter for such cases.
+
+      In other cases, key definition has changed if we are using a
+      different field or if the used key part length is different, or
+      key part direction has changed.
+    */
+    if (key_part->length != new_part->length &&
+        ha_alter_info->alter_info->flags == Alter_info::ALTER_CHANGE_COLUMN &&
+        (key_part->field->is_equal((Create_field *)new_field) == IS_EQUAL_PACK_LENGTH))
+    {
+      ha_alter_info->handler_flags|=
+          Alter_inplace_info::ALTER_COLUMN_INDEX_LENGTH;
+    }
+    else if (key_part->length != new_part->length)
+      return true;
 
     /*
       For prefix keys KEY_PART_INFO::field points to cloned Field
@@ -7382,7 +7505,8 @@ bool alter_table_manage_keys(TABLE *table, int indexes_were_disabled,
   case Alter_info::LEAVE_AS_IS:
     if (!indexes_were_disabled)
       break;
-    /* fall-through: disabled indexes */
+    // fallthrough
+    // disabled indexes
   case Alter_info::DISABLE:
     error= table->file->ha_disable_indexes(HA_KEY_SWITCH_NONUNIQ_SAVE);
   }
@@ -7625,24 +7749,21 @@ static bool mysql_inplace_alter_table(THD *thd,
 
   if (alter_ctx->error_if_not_empty)
   {
-    // We should have upgraded from MDL_SHARED_UPGRADABLE to a lock
-    // blocking writes for it to be safe to check ha_records().
-    if (table->mdl_ticket->get_type() == MDL_SHARED_UPGRADABLE)
+    bool has_records= true;
+    DBUG_ASSERT(table->mdl_ticket->get_type() == MDL_EXCLUSIVE);
+    if (table_list->table->file->ha_table_flags() & HA_HAS_RECORDS)
+    {
+      ha_rows tmp= 0;
+      if (!table_list->table->file->ha_records(&tmp) && tmp == 0)
+        has_records= false;
+    }
+    else if(table_list->table->contains_records(thd, &has_records))
     {
       my_error(ER_INVALID_USE_OF_NULL, MYF(0));
       goto cleanup;
     }
 
-    // Check if the handler supports ha_records()
-    if (!(table_list->table->file->ha_table_flags() & HA_HAS_RECORDS))
-    {
-      // If ha_records() is not supported, be conservative.
-      my_error(ER_INVALID_USE_OF_NULL, MYF(0));
-      goto cleanup;
-    }
-
-    ha_rows tmp= 0;
-    if (table_list->table->file->ha_records(&tmp) || tmp > 0)
+    if (has_records)
     {
       if (alter_ctx->error_if_not_empty &
           Alter_table_ctx::GEOMETRY_WITHOUT_DEFAULT)
@@ -8302,39 +8423,51 @@ mysql_prepare_alter_table(THD *thd, TABLE *table,
     }
 
     /*
-      Check that the DATE/DATETIME not null field we are going to add is
-      either has a default value or the '0000-00-00' is allowed by the
-      set sql mode.
-      If the '0000-00-00' value isn't allowed then raise the error_if_not_empty
-      flag to allow ALTER TABLE only if the table to be altered is empty.
+      New columns of type DATE/DATETIME/GEOMETRIC with NOT NULL constraint
+      added as part of ALTER operation will generate zero date for DATE/
+      DATETIME types and empty string for GEOMETRIC types when the table
+      is not empty. Hence certain additional checks needs to be performed
+      as described below. This cannot be caught by SE(For INPLACE ALTER)
+      since it checks for only NULL value. Zero date and empty string
+      does not violate the NOT NULL value constraint.
     */
-    if ((def->sql_type == MYSQL_TYPE_DATE ||
-         def->sql_type == MYSQL_TYPE_NEWDATE ||
-         def->sql_type == MYSQL_TYPE_DATETIME ||
-         def->sql_type == MYSQL_TYPE_DATETIME2) &&
-         !alter_ctx->datetime_field &&
-         !(~def->flags & (NO_DEFAULT_VALUE_FLAG | NOT_NULL_FLAG)))
+    if (!def->change)
     {
+      /*
+        Check that the DATE/DATETIME not null field we are going to add is
+        either has a default value or the '0000-00-00' is allowed by the
+        set sql mode.
+        If the '0000-00-00' value isn't allowed then raise the error_if_not_empty
+        flag to allow ALTER TABLE only if the table to be altered is empty.
+      */
+      if ((def->sql_type == MYSQL_TYPE_DATE ||
+           def->sql_type == MYSQL_TYPE_NEWDATE ||
+           def->sql_type == MYSQL_TYPE_DATETIME ||
+           def->sql_type == MYSQL_TYPE_DATETIME2) &&
+          !alter_ctx->datetime_field &&
+          !(~def->flags & (NO_DEFAULT_VALUE_FLAG | NOT_NULL_FLAG)))
+      {
         alter_ctx->datetime_field= def;
         alter_ctx->error_if_not_empty|=
           Alter_table_ctx::DATETIME_WITHOUT_DEFAULT;
-    }
+      }
 
-    /*
-      New GEOMETRY (and subtypes) columns can't be NOT NULL. To add a
-      GEOMETRY NOT NULL column, first create a GEOMETRY NULL column,
-      UPDATE the table to set a different value than NULL, and then do
-      a ALTER TABLE MODIFY COLUMN to set NOT NULL.
+      /*
+        New GEOMETRY (and subtypes) columns can't be NOT NULL. To add a
+        GEOMETRY NOT NULL column, first create a GEOMETRY NULL column,
+        UPDATE the table to set a different value than NULL, and then do
+        a ALTER TABLE MODIFY COLUMN to set NOT NULL.
 
-      This restriction can be lifted once MySQL supports default
-      values (i.e., functions) for geometry columns. The new
-      restriction would then be for added GEOMETRY NOT NULL columns to
-      always have a provided default value.
-    */
-    if (def->sql_type == MYSQL_TYPE_GEOMETRY &&
-        (def->flags & (NO_DEFAULT_VALUE_FLAG | NOT_NULL_FLAG)))
-    {
-      alter_ctx->error_if_not_empty|= Alter_table_ctx::GEOMETRY_WITHOUT_DEFAULT;
+        This restriction can be lifted once MySQL supports default
+        values (i.e., functions) for geometry columns. The new
+        restriction would then be for added GEOMETRY NOT NULL columns to
+        always have a provided default value.
+      */
+      if (def->sql_type == MYSQL_TYPE_GEOMETRY &&
+          (def->flags & (NO_DEFAULT_VALUE_FLAG | NOT_NULL_FLAG)))
+      {
+        alter_ctx->error_if_not_empty|= Alter_table_ctx::GEOMETRY_WITHOUT_DEFAULT;
+      }
     }
 
     if (!def->after)
@@ -9497,15 +9630,33 @@ bool mysql_alter_table(THD *thd, const char *new_db, const char *new_name,
   if (error)
     DBUG_RETURN(true);
 
-  // Check if ALTER TABLE ... ENGINE is disallowed by the storage engine.
+  /*
+    Check if ALTER TABLE ... ENGINE is disallowed by the desired storage
+    engine.
+  */
   if (table_list->table->s->db_type() != create_info->db_type &&
       (alter_info->flags & Alter_info::ALTER_OPTIONS) &&
       (create_info->used_fields & HA_CREATE_USED_ENGINE) &&
        ha_is_storage_engine_disabled(create_info->db_type))
   {
-    my_error(ER_DISABLED_STORAGE_ENGINE, MYF(0),
-              ha_resolve_storage_engine_name(create_info->db_type));
-    DBUG_RETURN(true);
+    /*
+      If NO_ENGINE_SUBSTITUTION is disabled, then report a warning and do not
+      alter the table.
+    */
+    if (is_engine_substitution_allowed(thd))
+    {
+      push_warning_printf(thd, Sql_condition::SL_WARNING,
+                          ER_UNKNOWN_STORAGE_ENGINE,
+                          ER(ER_UNKNOWN_STORAGE_ENGINE),
+                          ha_resolve_storage_engine_name(create_info->db_type));
+      create_info->db_type= table_list->table->s->db_type();
+    }
+    else
+    {
+      my_error(ER_DISABLED_STORAGE_ENGINE, MYF(0),
+               ha_resolve_storage_engine_name(create_info->db_type));
+      DBUG_RETURN(true);
+    }
   }
 
   TABLE *table= table_list->table;
@@ -9647,7 +9798,8 @@ bool mysql_alter_table(THD *thd, const char *new_db, const char *new_name,
    till this point for the alter operation.
   */
   if ((alter_info->flags & Alter_info::ADD_FOREIGN_KEY) &&
-      check_fk_parent_table_access(thd, create_info, alter_info))
+      check_fk_parent_table_access(thd, alter_ctx.new_db,
+                                   create_info, alter_info))
     DBUG_RETURN(true);
 
   /*
@@ -10705,7 +10857,6 @@ copy_data_between_tables(PSI_stage_progress *psi,
       from->sort.io_cache=(IO_CACHE*) my_malloc(key_memory_TABLE_sort_io_cache,
                                                 sizeof(IO_CACHE),
                                                 MYF(MY_FAE | MY_ZEROFILL));
-      memset(&tables, 0, sizeof(tables));
       tables.table= from;
       tables.alias= tables.table_name= from->s->table_name.str;
       tables.db= from->s->db.str;
@@ -10874,7 +11025,6 @@ bool mysql_recreate_table(THD *thd, TABLE_LIST *table_list, bool table_copy)
   /* Same applies to MDL request. */
   table_list->mdl_request.set_type(MDL_SHARED_NO_WRITE);
 
-  memset(&create_info, 0, sizeof(create_info));
   create_info.row_type=ROW_TYPE_NOT_USED;
   create_info.default_table_charset=default_charset_info;
   /* Force alter table to recreate table */
@@ -11094,7 +11244,7 @@ static bool check_engine(THD *thd, const char *db_name,
   handlerton *enf_engine= NULL;
 
   bool no_substitution=
-        MY_TEST(thd->variables.sql_mode & MODE_NO_ENGINE_SUBSTITUTION);
+        MY_TEST(!is_engine_substitution_allowed(thd));
 
   if (!opt_bootstrap && !opt_noacl)
   {
@@ -11148,10 +11298,10 @@ static bool check_engine(THD *thd, const char *db_name,
   }
 
   /*
-    Check, if the given table name is system table, and if the storage engine 
+    Check, if the given table name is system table, and if the storage engine
     does supports it.
   */
-  if (!ha_check_if_supported_system_table(*new_engine, db_name, table_name))
+  if (!ha_is_valid_system_or_user_table(*new_engine, db_name, table_name))
   {
     my_error(ER_UNSUPPORTED_ENGINE, MYF(0),
              ha_resolve_storage_engine_name(*new_engine), db_name, table_name);
@@ -11162,15 +11312,14 @@ static bool check_engine(THD *thd, const char *db_name,
     Check if the given table has compressed columns, and if the storage engine
     does support it.
   */
-  List_iterator<Create_field> it(
-    const_cast<List<Create_field>&>(alter_info->create_list));
-  Create_field* sql_field= it++;
-  while (sql_field != 0 &&
-         sql_field->column_format() != COLUMN_FORMAT_TYPE_COMPRESSED)
-    sql_field= it++;
-  if (sql_field != 0 &&
-    ((*new_engine)->create_zip_dict == 0 ||
-     (*new_engine)->drop_zip_dict == 0))
+  partition_info *part_info= thd->work_part_info;
+  bool check_compressed_columns= part_info == 0 &&
+    !(create_info->db_type->partition_flags &&
+    (create_info->db_type->partition_flags() & HA_USE_AUTO_PARTITION));
+
+  if (check_compressed_columns && alter_info->has_compressed_columns() &&
+      !ha_check_storage_engine_flag(*new_engine,
+                                    HTON_SUPPORTS_COMPRESSED_COLUMNS))
   {
     my_error(ER_ILLEGAL_HA_CREATE_OPTION, MYF(0),
       ha_resolve_storage_engine_name(*new_engine), "COMPRESSED COLUMNS");

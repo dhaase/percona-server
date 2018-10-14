@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2016, Oracle and/or its affiliates. All rights reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All rights reserved.
 Copyright (c) 2008, 2009, Google Inc.
 Copyright (c) 2009, 2016, Percona Inc.
 
@@ -45,6 +45,7 @@ Created 10/10/1995 Heikki Tuuri
 
 #include "mysql/psi/mysql_stage.h"
 #include "mysql/psi/psi.h"
+#include "sql_thd_internal_api.h"
 
 #include "univ.i"
 #ifndef UNIV_HOTBACKUP
@@ -137,6 +138,21 @@ struct srv_stats_t {
 	ulint_ctr_64_t		n_rows_inserted;
 
 	ulint_ctr_1_t		n_lock_max_wait_time;
+
+	/** Number of buffered aio requests submitted */
+	ulint_ctr_64_t		n_aio_submitted;
+
+	/* Number of merge blocks encrypted */
+	ulint_ctr_64_t          n_merge_blocks_encrypted;
+
+	/* Number of merge blocks decrypted */
+	ulint_ctr_64_t          n_merge_blocks_decrypted;
+
+	/* Number of row log blocks encrypted */
+	ulint_ctr_64_t          n_rowlog_blocks_encrypted;
+
+	/* Number of row log blocks decrypted */
+	ulint_ctr_64_t          n_rowlog_blocks_decrypted;
 };
 
 extern const char*	srv_main_thread_op_info;
@@ -193,10 +209,6 @@ at a time */
 extern ib_mutex_t	page_zip_stat_per_index_mutex;
 /* Mutex for locking srv_monitor_file. Not created if srv_read_only_mode */
 extern ib_mutex_t	srv_monitor_file_mutex;
-
-/* prototypes for new functions added to ha_innodb.cc */
-bool	innobase_get_slow_log();
-
 /* Temporary file for innodb monitor output */
 extern FILE*	srv_monitor_file;
 /* Mutex for locking srv_dict_tmpfile. Only created if !srv_read_only_mode.
@@ -269,7 +281,12 @@ any of the rollback-segment based on configuration used. */
 extern ulint	srv_undo_tablespaces_active;
 
 /** The number of undo segments to use */
+extern ulong	srv_rollback_segments;
+
+/* Used for the deprecated setting innodb_undo_logs. This will get put into
+srv_rollback_segments if it is set to non=default */
 extern ulong	srv_undo_logs;
+extern const char* deprecated_undo_logs;
 
 /** Maximum size of undo tablespace. */
 extern unsigned long long	srv_max_undo_log_size;
@@ -283,6 +300,14 @@ extern my_bool	srv_undo_log_truncate;
 /** UNDO logs not redo logged, these logs reside in the temp tablespace.*/
 extern const ulong	srv_tmp_undo_logs;
 
+/** Enable or disable encryption of temporary tablespace.*/
+extern my_bool	srv_tmp_tablespace_encrypt;
+
+/** Enable this option to encrypt system tablespace at bootstrap. */
+extern my_bool	srv_sys_tablespace_encrypt;
+
+/** Enable or disable encryption of pages in parallel doublewrite buffer file */
+extern my_bool	srv_parallel_dblwr_encrypt;
 
 /** Whether the redo log tracking is currently enabled. Note that it is
 possible for the log tracker thread to be running and the tracking to be
@@ -336,7 +361,7 @@ extern const ulint	srv_buf_pool_min_size;
 extern const ulint	srv_buf_pool_def_size;
 /** Requested buffer pool chunk size. Each buffer pool instance consists
 of one or more chunks. */
-extern ulong		srv_buf_pool_chunk_unit;
+extern ulonglong	srv_buf_pool_chunk_unit;
 /** Requested number of buffer pool instances */
 extern ulong		srv_buf_pool_instances;
 /** Default number of buffer pool instances */
@@ -509,6 +534,8 @@ extern ulint	srv_fatal_semaphore_wait_threshold;
 extern ulint	srv_dml_needed_delay;
 extern lint	srv_kill_idle_transaction;
 
+extern my_bool	srv_encrypt_online_alter_logs;
+
 #define SRV_MAX_N_IO_THREADS	130
 
 #define SRV_MAX_N_PURGE_THREADS 32
@@ -558,7 +585,17 @@ extern ulong srv_sync_array_size;
 /* print all user-level transactions deadlocks to mysqld stderr */
 extern my_bool srv_print_all_deadlocks;
 
+/* print lock wait timeout info to mysqld stderr */
+extern my_bool srv_print_lock_wait_timeout_info;
+
 extern my_bool	srv_cmp_per_index_enabled;
+
+extern ulong srv_encrypt_tables;
+
+/** Number of times secondary index lookup triggered cluster lookup */
+extern ulint	srv_sec_rec_cluster_reads;
+/** Number of times prefix optimization avoided triggering cluster lookup */
+extern ulint	srv_sec_rec_cluster_reads_avoided;
 
 /** Status variables to be passed to MySQL */
 extern struct export_var_t export_vars;
@@ -590,7 +627,7 @@ extern mysql_pfs_key_t	srv_log_tracking_thread_key;
 schema */
 #  define pfs_register_thread(key)			\
 do {								\
-	struct PSI_thread* psi = PSI_THREAD_CALL(new_thread)(key, NULL, 0);\
+	struct PSI_thread* psi = PSI_THREAD_CALL(new_thread)(key.m_value, NULL, 0);\
 	PSI_THREAD_CALL(set_thread_os_id)(psi);			\
 	PSI_THREAD_CALL(set_thread)(psi);			\
 } while (0)
@@ -971,6 +1008,13 @@ MLOG_TRUNCATE REDO log record. */
 bool
 srv_was_tablespace_truncated(const fil_space_t* space);
 
+/** Check whether given space id is undo tablespace id
+@param[in]	space_id	space id to check
+@return true if it is undo tablespace else false. */
+bool
+srv_is_undo_tablespace(
+	ulint	space_id);
+
 #ifdef UNIV_DEBUG
 /** Disables master thread. It's used by:
 	SET GLOBAL innodb_master_thread_disabled_debug = 1 (0).
@@ -985,6 +1029,14 @@ srv_master_thread_disabled_debug_update(
 	void*				var_ptr,
 	const void*			save);
 #endif /* UNIV_DEBUG */
+
+/** Set temporary tablespace to be encrypted if global variable
+innodb_temp_tablespace_encrypt is TRUE
+@param[in]	enable	true to enable encryption, false to disable
+@return DB_SUCCESS on success, DB_ERROR on failure */
+MY_NODISCARD
+dberr_t
+srv_temp_encryption_update(bool enable);
 
 /** Status variables to be passed to MySQL */
 struct export_var_t{
@@ -1076,6 +1128,18 @@ struct export_var_t{
 						index lookups when freeing
 						file pages */
 #endif /* UNIV_DEBUG */
+	ib_uint64_t innodb_n_merge_blocks_encrypted;/*!< Number of merge blocks encrypted */
+	ib_uint64_t innodb_n_merge_blocks_decrypted;/*!< Number of merge blocks decrypted */
+	ib_uint64_t innodb_n_rowlog_blocks_encrypted;/*!< Number of row log blocks encrypted */
+	ib_uint64_t innodb_n_rowlog_blocks_decrypted;/*!< Number of row log blocks decrypted */
+
+	ulint innodb_sec_rec_cluster_reads;	/*!< srv_sec_rec_cluster_reads */
+	ulint innodb_sec_rec_cluster_reads_avoided; /*!< srv_sec_rec_cluster_reads_avoided */
+
+	ulint innodb_buffered_aio_submitted;
+
+	fragmentation_stats_t innodb_fragmentation_stats;/*!< Fragmentation
+						statistics */
 };
 
 /** Thread slot in the thread table.  */

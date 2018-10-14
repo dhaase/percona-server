@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2008, 2009 Google Inc.
 Copyright (c) 2009, 2016, Percona Inc.
 
@@ -64,6 +64,7 @@ Created 10/8/1995 Heikki Tuuri
 #include "que0que.h"
 #include "row0mysql.h"
 #include "row0trunc.h"
+#include "row0log.h"
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "srv0start.h"
@@ -76,6 +77,10 @@ Created 10/8/1995 Heikki Tuuri
 #include "handler.h"
 #include "ha_innodb.h"
 
+
+#ifndef UNIV_PFS_THREAD
+#define create_thd(x,y,z,PFS_KEY)	create_thd(x,y,z,PFS_NOT_INSTRUMENTED.m_value)
+#endif /* UNIV_PFS_THREAD */
 
 /* The following is the maximum allowed duration of a lock wait. */
 ulint	srv_fatal_semaphore_wait_threshold = 600;
@@ -122,7 +127,17 @@ any of the rollback-segment based on configuration used. */
 ulint	srv_undo_tablespaces_active = 0;
 
 /* The number of rollback segments to use */
-ulong	srv_undo_logs = 1;
+ulong	srv_rollback_segments = 1;
+
+/* Used for the deprecated setting innodb_undo_logs. This will still get
+put into srv_rollback_segments if it is set to a non-default value. */
+ulong	srv_undo_logs = 0;
+const char* deprecated_undo_logs =
+	"The parameter innodb_undo_logs is deprecated"
+	" and may be removed in future releases."
+	" Please use innodb_rollback_segments instead."
+	" See " REFMAN "innodb-undo-logs.html";
+
 
 /** Rate at which UNDO records should be purged. */
 ulong	srv_purge_rseg_truncate_frequency = 128;
@@ -140,6 +155,16 @@ unsigned long long	srv_max_undo_log_size;
 /** UNDO logs that are not redo logged.
 These logs reside in the temp tablespace.*/
 const ulong		srv_tmp_undo_logs = 32;
+
+/** Enable or disable encryption of temporary tablespace.*/
+my_bool	srv_tmp_tablespace_encrypt;
+
+/** Option to enable encryption of system tablespace. */
+my_bool	srv_sys_tablespace_encrypt;
+
+/** Enable or disable encryption of pages in parallel doublewrite buffer
+file */
+my_bool	srv_parallel_dblwr_encrypt;
 
 /** Default undo tablespace size in UNIV_PAGEs count (10MB). */
 const ulint SRV_UNDO_TABLESPACE_SIZE_IN_PAGES =
@@ -254,7 +279,7 @@ const ulint	srv_buf_pool_min_size	= 5 * 1024 * 1024;
 const ulint	srv_buf_pool_def_size	= 128 * 1024 * 1024;
 /** Requested buffer pool chunk size. Each buffer pool instance consists
 of one or more chunks. */
-ulong	srv_buf_pool_chunk_unit;
+ulonglong	srv_buf_pool_chunk_unit;
 /** Requested number of buffer pool instances */
 ulong	srv_buf_pool_instances;
 /** Default number of buffer pool instances */
@@ -383,6 +408,8 @@ ulong	srv_n_purge_threads = 4;
 /* the number of pages to purge in one batch */
 ulong	srv_purge_batch_size = 20;
 
+ulong srv_encrypt_tables = 0;
+
 /* Internal setting for "innodb_stats_method". Decides how InnoDB treats
 NULL value when collecting statistics. By default, it is set to
 SRV_STATS_NULLS_EQUAL(0), ie. all NULL value are treated equal */
@@ -407,6 +434,10 @@ ulong	srv_force_recovery_crash;
 /** Print all user-level transactions deadlocks to mysqld stderr */
 
 my_bool	srv_print_all_deadlocks = FALSE;
+
+/** Print lock wait timeout info to mysqld stderr */
+
+my_bool	srv_print_lock_wait_timeout_info = FALSE;
 
 /** Enable INFORMATION_SCHEMA.innodb_cmp_per_index */
 my_bool	srv_cmp_per_index_enabled = FALSE;
@@ -507,6 +538,12 @@ static ulint		srv_main_idle_loops		= 0;
 static ulint		srv_main_shutdown_loops		= 0;
 /** Log writes involving flush. */
 static ulint		srv_log_writes_and_flush	= 0;
+
+/** Number of times secondary index lookup triggered cluster lookup */
+ulint	srv_sec_rec_cluster_reads		= 0;
+
+/** Number of times prefix optimization avoided triggering cluster lookup */
+ulint	srv_sec_rec_cluster_reads_avoided	= 0;
 
 /* This is only ever touched by the master thread. It records the
 time when the last flush of log file has happened. The master
@@ -1742,6 +1779,18 @@ srv_export_innodb_status(void)
 
 	export_vars.innodb_available_undo_logs = srv_available_undo_logs;
 
+	export_vars.innodb_n_merge_blocks_encrypted =
+		srv_stats.n_merge_blocks_encrypted;
+
+	export_vars.innodb_n_merge_blocks_decrypted =
+		srv_stats.n_merge_blocks_decrypted;
+
+	export_vars.innodb_n_rowlog_blocks_encrypted =
+		srv_stats.n_rowlog_blocks_encrypted;
+
+	export_vars.innodb_n_rowlog_blocks_decrypted =
+		srv_stats.n_rowlog_blocks_decrypted;
+
 #ifdef UNIV_DEBUG
 	rw_lock_s_lock(&purge_sys->latch);
 	trx_id_t	up_limit_id;
@@ -1771,6 +1820,18 @@ srv_export_innodb_status(void)
 			(ulint) (max_trx_id - up_limit_id);
 	}
 #endif /* UNIV_DEBUG */
+
+	os_rmb;
+	export_vars.innodb_sec_rec_cluster_reads =
+		srv_sec_rec_cluster_reads;
+	export_vars.innodb_sec_rec_cluster_reads_avoided =
+		srv_sec_rec_cluster_reads_avoided;
+
+	export_vars.innodb_buffered_aio_submitted =
+		srv_stats.n_aio_submitted;
+
+	thd_get_fragmentation_stats(current_thd,
+		&export_vars.innodb_fragmentation_stats);
 
 	mutex_exit(&srv_innodb_monitor_mutex);
 }
@@ -2639,6 +2700,45 @@ func_exit:
 	return(n_bytes_merged || n_tables_to_drop);
 }
 
+/** Set temporary tablespace to be encrypted if global variable
+innodb_temp_tablespace_encrypt is TRUE
+@param[in]	enable	true to enable encryption, false to disable
+@return DB_SUCCESS on success, DB_ERROR on failure */
+dberr_t
+srv_temp_encryption_update(bool enable)
+{
+	ut_ad(!srv_read_only_mode);
+
+	fil_space_t*	space = fil_space_get(srv_tmp_space.space_id());
+	bool		is_encrypted = FSP_FLAGS_GET_ENCRYPTION(space->flags);
+
+	ut_ad(fsp_is_system_temporary(space->id));
+
+	if (enable) {
+
+		if (is_encrypted) {
+			/* Encryption already enabled */
+			return(DB_SUCCESS);
+		} else {
+			/* Enable encryption now */
+			dberr_t err = fil_temp_update_encryption(space);
+			if (err == DB_SUCCESS) {
+				srv_tmp_space.set_flags(space->flags);
+			}
+			return(err);
+		}
+
+	} else {
+		if (!is_encrypted) {
+			/* Encryption already disabled */
+			return(DB_SUCCESS);
+		} else {
+			// TODO: Disabling encryption is not allowed yet
+			return(DB_SUCCESS);
+		}
+	}
+}
+
 /*********************************************************************//**
 Puts master thread to sleep. At this point we are using polling to
 service various activities. Master thread sleeps for one second before
@@ -2833,7 +2933,7 @@ DECLARE_THREAD(srv_worker_thread)(
 	ut_ad(!srv_read_only_mode);
 	ut_a(srv_force_recovery < SRV_FORCE_NO_BACKGROUND);
 	my_thread_init();
-	THD *thd= create_thd(false, true, true, srv_worker_thread_key);
+	THD *thd= create_thd(false, true, true, srv_worker_thread_key.m_value);
 
 	srv_purge_tids[tid_i] = os_thread_get_tid();
 	os_thread_set_priority(srv_purge_tids[tid_i],
@@ -3105,7 +3205,7 @@ DECLARE_THREAD(srv_purge_coordinator_thread)(
 						required by os_thread_create */
 {
 	my_thread_init();
-	THD *thd= create_thd(false, true, true, srv_purge_thread_key);
+	THD *thd= create_thd(false, true, true, srv_purge_thread_key.m_value);
 	srv_slot_t*	slot;
 	ulint           n_total_purged = ULINT_UNDEFINED;
 
@@ -3344,4 +3444,20 @@ srv_fatal_error()
 	srv_shutdown_all_bg_threads();
 
 	exit(3);
+}
+
+/** Check whether given space id is undo tablespace id
+@param[in]	space_id	space id to check
+@return true if it is undo tablespace else false. */
+bool
+srv_is_undo_tablespace(
+	ulint	space_id)
+{
+	if (srv_undo_space_id_start == 0) {
+		return(false);
+	}
+
+	return(space_id >= srv_undo_space_id_start
+	       && space_id < (srv_undo_space_id_start
+			      + srv_undo_tablespaces_open));
 }

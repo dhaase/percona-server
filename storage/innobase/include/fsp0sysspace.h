@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2013, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2013, 2017, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -282,6 +282,18 @@ extern SysTablespace srv_sys_space;
 /** The control info of a temporary table shared tablespace. */
 extern SysTablespace srv_tmp_space;
 
+/** Check if the space_id is for a shared system tablespace.
+@param[in]	id	Space ID to check
+@return true if id is a system tablespace, false if not. */
+UNIV_INLINE
+bool
+MY_ATTRIBUTE((warn_unused_result))
+is_shared_system_tablespace(
+	ulint	id)
+{
+	return(id == srv_sys_space.space_id());
+}
+
 /** Check if the space_id is for a system-tablespace (shared + temp).
 @param[in]	id	Space ID to check
 @return true if id is a system tablespace, false if not. */
@@ -302,7 +314,7 @@ is_system_or_undo_tablespace(
 	ulint   id)
 {
 	return(id == srv_sys_space.space_id()
-	       || id <= srv_undo_tablespaces_open);
+	       || srv_is_undo_tablespace(id));
 }
 
 /** Check if predefined shared tablespace.
@@ -314,7 +326,7 @@ is_predefined_tablespace(
 {
 	ut_ad(srv_sys_space.space_id() == TRX_SYS_SPACE);
 	ut_ad(TRX_SYS_SPACE == 0);
-	return(id <= srv_undo_tablespaces_open
+	return(is_system_or_undo_tablespace(id)
 	       || id == srv_tmp_space.space_id());
 }
 #endif /* fsp0sysspace_h */

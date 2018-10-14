@@ -1,4 +1,4 @@
-# Copyright (c) 2011, 2014, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2011, 2017, Oracle and/or its affiliates. All rights reserved.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,20 +24,28 @@ INCLUDE_DIRECTORIES(${CMAKE_SOURCE_DIR}/plugin/innodb_memcached/innodb_memcache
 		    ${CMAKE_SOURCE_DIR}/plugin/innodb_memcached/innodb_memcache/cache-src
 		    ${CMAKE_SOURCE_DIR}/plugin/innodb_memcached/daemon_memcached/include)
 
-# If current CMAKE_C_FLAGS is with Werror, turn it off to compile successfully
-IF(CMAKE_C_FLAGS MATCHES "-Werror")
-  STRING(REGEX REPLACE "-Werror( |$)" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
-  # Turn -Wdeclaration-after-statement off to reduce the number of warnings
-  STRING(REGEX REPLACE "-Wdeclaration-after-statement" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
-ENDIF(CMAKE_C_FLAGS MATCHES "-Werror")
+# Remove "-Wdeclaration-after-statement" flag if exists to reduce the number of warnings
+STRING(REGEX REPLACE "-Wdeclaration-after-statement" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 
-SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CMAKE_SHARED_LIBRARY_C_FLAGS} -std=gnu99")
+# Set extra flags for the C compiler
+IF(CMAKE_COMPILER_IS_GNUCC OR CMAKE_C_COMPILER_ID MATCHES "Clang")
+  # Disable "-Wunused-parameter -Wsign-compare -Wunused-but-set-variable" flags
+  SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CMAKE_SHARED_LIBRARY_C_FLAGS} -Wno-unused-parameter -Wno-sign-compare -std=gnu99")
+  MY_CHECK_C_COMPILER_FLAG("-Wunused-but-set-variable" HAVE_UNUSET_BUT_SET_VARIABLE) # Requires GCC 4.5+
+  IF(HAVE_UNUSET_BUT_SET_VARIABLE)
+    SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-unused-but-set-variable")
+  ENDIF()
+  MY_CHECK_C_COMPILER_FLAG("-Wenum-conversion" HAVE_ENUM_CONVERSION) # Requires clang
+  IF(HAVE_ENUM_CONVERSION)
+    SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-enum-conversion")
+  ENDIF()
+ENDIF()
 
 SET(MCD__UTILITITY_SOURCES
 		util-src/config_parser.c
 		util-src/util.c)
 
-ADD_LIBRARY(libmcd_util STATIC ${MCD__UTILITITY_SOURCES})
+ADD_CONVENIENCE_LIBRARY(libmcd_util ${MCD__UTILITITY_SOURCES})
 
 SET(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS}
                      -I${CMAKE_SOURCE_DIR}/plugin/innodb_memcached/innodb_memcache/include
@@ -58,7 +66,5 @@ SET(INNODB_ENGINE_SOURCES
 # ADD_LIBRARY(innodb_engine SHARED ${INNODB_ENGINE_SOURCES})
 
 MYSQL_ADD_PLUGIN(innodb_engine ${INNODB_ENGINE_SOURCES}
-		MODULE_ONLY MODULE_OUTPUT_NAME "innodb_engine")
-
-TARGET_LINK_LIBRARIES(innodb_engine libmcd_util)
-
+                 LINK_LIBRARIES libmcd_util
+		 MODULE_ONLY MODULE_OUTPUT_NAME "innodb_engine")

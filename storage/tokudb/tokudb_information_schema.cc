@@ -66,14 +66,13 @@ struct trx_extra_t {
     TABLE *table;
 };
 
-int trx_callback(
-    DB_TXN* txn,
-    iterate_row_locks_callback iterate_locks,
-    void* locks_extra,
-    void *extra) {
-
+int trx_callback(DB_TXN* txn,
+                 TOKUDB_UNUSED(iterate_row_locks_callback iterate_locks),
+                 TOKUDB_UNUSED(void* locks_extra),
+                 void* extra) {
     uint64_t txn_id = txn->id64(txn);
-    uint64_t client_id = txn->get_client_id(txn);
+    uint64_t client_id;
+    txn->get_client_id(txn, &client_id, NULL);
     uint64_t start_time = txn->get_start_time(txn);
     trx_extra_t* e = reinterpret_cast<struct trx_extra_t*>(extra);
     THD* thd = e->thd;
@@ -88,15 +87,11 @@ int trx_callback(
     return error;
 }
 
-#if MYSQL_VERSION_ID >= 50600
-int trx_fill_table(THD* thd, TABLE_LIST* tables, Item* cond) {
-#else
-int trx_fill_table(THD* thd, TABLE_LIST* tables, COND* cond) {
-#endif
+int trx_fill_table(THD* thd, TABLE_LIST* tables, TOKUDB_UNUSED(Item* cond)) {
     TOKUDB_DBUG_ENTER("");
     int error;
 
-    tokudb_hton_initialized_lock.lock_read();
+    rwlock_t_lock_read(tokudb_hton_initialized_lock);
 
     if (!tokudb_hton_initialized) {
         error = ER_PLUGIN_IS_NOT_LOADED;
@@ -119,7 +114,7 @@ int trx_init(void* p) {
     return 0;
 }
 
-int trx_done(void* p) {
+int trx_done(TOKUDB_UNUSED(void* p)) {
     return 0;
 }
 
@@ -135,13 +130,8 @@ st_mysql_plugin trx = {
     TOKUDB_PLUGIN_VERSION,
     NULL,                      /* status variables */
     NULL,                      /* system variables */
-#ifdef MARIA_PLUGIN_INTERFACE_VERSION
-    tokudb::sysvars::version,
-    MariaDB_PLUGIN_MATURITY_STABLE /* maturity */
-#else
     NULL,                      /* config options */
     0,                         /* flags */
-#endif
 };
 
 
@@ -187,13 +177,13 @@ int lock_waits_callback(
     size_t dname_length = strlen(dname);
     table->field[2]->store(dname, dname_length, system_charset_info);
     String left_str;
-    tokudb_pretty_left_key(db, left_key, &left_str);
+    tokudb_pretty_left_key(left_key, &left_str);
     table->field[3]->store(
         left_str.ptr(),
         left_str.length(),
         system_charset_info);
     String right_str;
-    tokudb_pretty_right_key(db, right_key, &right_str);
+    tokudb_pretty_right_key(right_key, &right_str);
     table->field[4]->store(
         right_str.ptr(),
         right_str.length(),
@@ -223,15 +213,13 @@ int lock_waits_callback(
     return error;
 }
 
-#if MYSQL_VERSION_ID >= 50600
-int lock_waits_fill_table(THD* thd, TABLE_LIST* tables, Item* cond) {
-#else
-int lock_waits_fill_table(THD* thd, TABLE_LIST* tables, COND* cond) {
-#endif
+int lock_waits_fill_table(THD* thd,
+                          TABLE_LIST* tables,
+                          TOKUDB_UNUSED(Item* cond)) {
     TOKUDB_DBUG_ENTER("");
     int error;
 
-    tokudb_hton_initialized_lock.lock_read();
+    rwlock_t_lock_read(tokudb_hton_initialized_lock);
 
     if (!tokudb_hton_initialized) {
         error = ER_PLUGIN_IS_NOT_LOADED;
@@ -257,7 +245,7 @@ int lock_waits_init(void* p) {
     return 0;
 }
 
-int lock_waits_done(void *p) {
+int lock_waits_done(TOKUDB_UNUSED(void *p)) {
     return 0;
 }
 
@@ -273,13 +261,8 @@ st_mysql_plugin lock_waits = {
     TOKUDB_PLUGIN_VERSION,
     NULL,                       /* status variables */
     NULL,                       /* system variables */
-#ifdef MARIA_PLUGIN_INTERFACE_VERSION
-    tokudb::sysvars::version,
-    MariaDB_PLUGIN_MATURITY_STABLE /* maturity */
-#else
     NULL,                       /* config options */
     0,                          /* flags */
-#endif
 };
 
 
@@ -312,7 +295,8 @@ int locks_callback(
     void* extra) {
 
     uint64_t txn_id = txn->id64(txn);
-    uint64_t client_id = txn->get_client_id(txn);
+    uint64_t client_id;
+    txn->get_client_id(txn, &client_id, NULL);
     locks_extra_t* e = reinterpret_cast<struct locks_extra_t*>(extra);
     THD* thd = e->thd;
     TABLE* table = e->table;
@@ -329,14 +313,14 @@ int locks_callback(
         table->field[2]->store(dname, dname_length, system_charset_info);
 
         String left_str;
-        tokudb_pretty_left_key(db, &left_key, &left_str);
+        tokudb_pretty_left_key(&left_key, &left_str);
         table->field[3]->store(
             left_str.ptr(),
             left_str.length(),
             system_charset_info);
 
         String right_str;
-        tokudb_pretty_right_key(db, &right_key, &right_str);
+        tokudb_pretty_right_key(&right_key, &right_str);
         table->field[4]->store(
             right_str.ptr(),
             right_str.length(),
@@ -365,15 +349,11 @@ int locks_callback(
     return error;
 }
 
-#if MYSQL_VERSION_ID >= 50600
-int locks_fill_table(THD* thd, TABLE_LIST* tables, Item* cond) {
-#else
-int locks_fill_table(THD* thd, TABLE_LIST* tables, COND* cond) {
-#endif
+int locks_fill_table(THD* thd, TABLE_LIST* tables, TOKUDB_UNUSED(Item* cond)) {
     TOKUDB_DBUG_ENTER("");
     int error;
 
-    tokudb_hton_initialized_lock.lock_read();
+    rwlock_t_lock_read(tokudb_hton_initialized_lock);
 
     if (!tokudb_hton_initialized) {
         error = ER_PLUGIN_IS_NOT_LOADED;
@@ -396,7 +376,7 @@ int locks_init(void* p) {
     return 0;
 }
 
-int locks_done(void* p) {
+int locks_done(TOKUDB_UNUSED(void* p)) {
     return 0;
 }
 
@@ -412,13 +392,8 @@ st_mysql_plugin locks = {
     TOKUDB_PLUGIN_VERSION,
     NULL,                       /* status variables */
     NULL,                       /* system variables */
-#ifdef MARIA_PLUGIN_INTERFACE_VERSION
-    tokudb::sysvars::version,
-    MariaDB_PLUGIN_MATURITY_STABLE /* maturity */
-#else
     NULL,                       /* config options */
     0,                         /* flags */
-#endif
 };
 
 
@@ -508,16 +483,14 @@ cleanup:
     return error;
 }
 
-#if MYSQL_VERSION_ID >= 50600
-int file_map_fill_table(THD* thd, TABLE_LIST* tables, Item* cond) {
-#else
-int file_map_fill_table(THD* thd, TABLE_LIST* tables, COND* cond) {
-#endif
+int file_map_fill_table(THD* thd,
+                        TABLE_LIST* tables,
+                        TOKUDB_UNUSED(Item* cond)) {
     TOKUDB_DBUG_ENTER("");
     int error;
     TABLE* table = tables->table;
 
-    tokudb_hton_initialized_lock.lock_read();
+    rwlock_t_lock_read(tokudb_hton_initialized_lock);
 
     if (!tokudb_hton_initialized) {
         error = ER_PLUGIN_IS_NOT_LOADED;
@@ -539,7 +512,7 @@ int file_map_init(void* p) {
     return 0;
 }
 
-int file_map_done(void* p) {
+int file_map_done(TOKUDB_UNUSED(void* p)) {
     return 0;
 }
 
@@ -555,13 +528,8 @@ st_mysql_plugin file_map = {
     TOKUDB_PLUGIN_VERSION,
     NULL,                       /* status variables */
     NULL,                       /* system variables */
-#ifdef MARIA_PLUGIN_INTERFACE_VERSION
-    tokudb::sysvars::version,
-    MariaDB_PLUGIN_MATURITY_STABLE /* maturity */
-#else
     NULL,                       /* config options */
     0,                          /* flags */
-#endif
 };
 
 
@@ -713,18 +681,16 @@ cleanup:
     return error;
 }
 
-#if MYSQL_VERSION_ID >= 50600
-int fractal_tree_info_fill_table(THD* thd, TABLE_LIST* tables, Item* cond) {
-#else
-int fractal_tree_info_fill_table(THD* thd, TABLE_LIST* tables, COND* cond) {
-#endif
+int fractal_tree_info_fill_table(THD* thd,
+                                 TABLE_LIST* tables,
+                                 TOKUDB_UNUSED(Item* cond)) {
     TOKUDB_DBUG_ENTER("");
     int error;
     TABLE* table = tables->table;
 
     // 3938: Get a read lock on the status flag, since we must
     // read it before safely proceeding
-    tokudb_hton_initialized_lock.lock_read();
+    rwlock_t_lock_read(tokudb_hton_initialized_lock);
 
     if (!tokudb_hton_initialized) {
         error = ER_PLUGIN_IS_NOT_LOADED;
@@ -747,7 +713,7 @@ int fractal_tree_info_init(void* p) {
     return 0;
 }
 
-int fractal_tree_info_done(void* p) {
+int fractal_tree_info_done(TOKUDB_UNUSED(void* p)) {
     return 0;
 }
 
@@ -763,13 +729,8 @@ st_mysql_plugin fractal_tree_info = {
     TOKUDB_PLUGIN_VERSION,
     NULL,                           /* status variables */
     NULL,                           /* system variables */
-#ifdef MARIA_PLUGIN_INTERFACE_VERSION
-    tokudb::sysvars::version,
-    MariaDB_PLUGIN_MATURITY_STABLE /* maturity */
-#else
     NULL,                           /* config options */
     0,                              /* flags */
-#endif
 };
 
 
@@ -1004,24 +965,17 @@ cleanup:
     return error;
 }
 
-#if MYSQL_VERSION_ID >= 50600
 int fractal_tree_block_map_fill_table(
     THD* thd,
     TABLE_LIST* tables,
-    Item* cond) {
-#else
-int fractal_tree_block_map_fill_table(
-    THD* thd,
-    TABLE_LIST* tables,
-    COND* cond) {
-#endif
+    TOKUDB_UNUSED(Item* cond)) {
     TOKUDB_DBUG_ENTER("");
     int error;
     TABLE* table = tables->table;
 
     // 3938: Get a read lock on the status flag, since we must
     // read it before safely proceeding
-    tokudb_hton_initialized_lock.lock_read();
+    rwlock_t_lock_read(tokudb_hton_initialized_lock);
 
     if (!tokudb_hton_initialized) {
         error = ER_PLUGIN_IS_NOT_LOADED;
@@ -1044,7 +998,7 @@ int fractal_tree_block_map_init(void* p) {
     return 0;
 }
 
-int fractal_tree_block_map_done(void *p) {
+int fractal_tree_block_map_done(TOKUDB_UNUSED(void *p)) {
     return 0;
 }
 
@@ -1060,13 +1014,8 @@ st_mysql_plugin fractal_tree_block_map = {
     TOKUDB_PLUGIN_VERSION,
     NULL,                      /* status variables */
     NULL,                      /* system variables */
-#ifdef MARIA_PLUGIN_INTERFACE_VERSION
-    tokudb::sysvars::version,
-    MariaDB_PLUGIN_MATURITY_STABLE /* maturity */
-#else
     NULL,                      /* config options */
     0,                         /* flags */
-#endif
 };
 
 
@@ -1083,7 +1032,7 @@ ST_FIELD_INFO background_job_status_field_info[] = {
     {"scheduler", 32, MYSQL_TYPE_STRING, 0, 0, NULL, SKIP_OPEN_TABLE },
     {"scheduled_time", 0, MYSQL_TYPE_DATETIME, 0, 0, NULL, SKIP_OPEN_TABLE },
     {"started_time", 0, MYSQL_TYPE_DATETIME, 0, MY_I_S_MAYBE_NULL, NULL, SKIP_OPEN_TABLE },
-    {"status", 1024, MYSQL_TYPE_STRING, 0, MY_I_S_MAYBE_NULL, SKIP_OPEN_TABLE },
+    {"status", 1024, MYSQL_TYPE_STRING, 0, MY_I_S_MAYBE_NULL, NULL, SKIP_OPEN_TABLE },
     {NULL, 0, MYSQL_TYPE_NULL, 0, 0, NULL, SKIP_OPEN_TABLE}
 };
 
@@ -1149,16 +1098,14 @@ int report_background_job_status(TABLE *table, THD *thd) {
     return error;
 }
 
-#if MYSQL_VERSION_ID >= 50600
-int background_job_status_fill_table(THD *thd, TABLE_LIST *tables, Item *cond) {
-#else
-int background_job_status_fill_table(THD *thd, TABLE_LIST *tables, COND *cond) {
-#endif
+int background_job_status_fill_table(THD* thd,
+                                     TABLE_LIST* tables,
+                                     TOKUDB_UNUSED(Item* cond)) {
     TOKUDB_DBUG_ENTER("");
     int error;
     TABLE* table = tables->table;
 
-    tokudb_hton_initialized_lock.lock_read();
+    rwlock_t_lock_read(tokudb_hton_initialized_lock);
 
     if (!tokudb_hton_initialized) {
         error = ER_PLUGIN_IS_NOT_LOADED;
@@ -1180,7 +1127,7 @@ int background_job_status_init(void* p) {
     return 0;
 }
 
-int background_job_status_done(void* p) {
+int background_job_status_done(TOKUDB_UNUSED(void* p)) {
     return 0;
 }
 
@@ -1196,13 +1143,8 @@ st_mysql_plugin background_job_status = {
     TOKUDB_PLUGIN_VERSION,
     NULL,                      /* status variables */
     NULL,                      /* system variables */
-#ifdef MARIA_PLUGIN_INTERFACE_VERSION
-    tokudb::sysvars::version,
-    MariaDB_PLUGIN_MATURITY_STABLE /* maturity */
-#else
     NULL,                      /* config options */
     0,                         /* flags */
-#endif
 };
 
 } // namespace information_schema

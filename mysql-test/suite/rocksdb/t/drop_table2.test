@@ -1,75 +1,69 @@
---source include/have_rocksdb_as_default.inc
+--source include/have_rocksdb.inc
 
---disable_warnings
-DROP TABLE IF EXISTS t1;
-DROP TABLE IF EXISTS t2;
-DROP TABLE IF EXISTS t3;
-DROP TABLE IF EXISTS t4;
-DROP TABLE IF EXISTS t5;
---enable_warnings
+call mtr.add_suppression("Column family 'cf1' not found");
+call mtr.add_suppression("Column family 'rev:cf2' not found");
 
 # Start from clean slate
 set global rocksdb_compact_cf = 'cf1';
 set global rocksdb_compact_cf = 'rev:cf2';
 set global rocksdb_signal_drop_index_thread = 1;
 --source include/restart_mysqld.inc
---exec truncate --size=0 $MYSQLTEST_VARDIR/log/mysqld.1.err
 
 CREATE TABLE t1 (
   a int not null,
   b int not null,
   primary key (a,b) comment 'cf1',
   key (b) comment 'rev:cf2'
-) ENGINE=RocksDB;
+) ENGINE=ROCKSDB;
 
 CREATE TABLE t2 (
   a int not null,
   b int not null,
   primary key (a,b) comment 'cf1',
   key (b) comment 'rev:cf2'
-) ENGINE=RocksDB;
+) ENGINE=ROCKSDB;
 
 CREATE TABLE t3 (
   a int not null,
   b int not null,
   primary key (a,b) comment 'cf1',
   key (b) comment 'rev:cf2'
-) ENGINE=RocksDB;
+) ENGINE=ROCKSDB;
 
 CREATE TABLE t4 (
   a int not null,
   b int not null,
   primary key (a,b) comment 'cf1',
   key (b) comment 'rev:cf2'
-) ENGINE=RocksDB;
+) ENGINE=ROCKSDB;
 
 # Populate tables
 let $max = 1000;
 let $table = t1;
---source drop_table_repopulate_table.inc
+--source suite/rocksdb/include/drop_table_repopulate_table.inc
 let $table = t2;
---source drop_table_repopulate_table.inc
+--source suite/rocksdb/include/drop_table_repopulate_table.inc
 let $table = t3;
---source drop_table_repopulate_table.inc
+--source suite/rocksdb/include/drop_table_repopulate_table.inc
 let $table = t4;
---source drop_table_repopulate_table.inc
+--source suite/rocksdb/include/drop_table_repopulate_table.inc
 
 
 # Restart the server before t2's indices are deleted
 --source include/restart_mysqld.inc
 
 let $table = t1;
---source drop_table_repopulate_table.inc
+--source suite/rocksdb/include/drop_table_repopulate_table.inc
 let $table = t4;
---source drop_table_repopulate_table.inc
+--source suite/rocksdb/include/drop_table_repopulate_table.inc
 
 
 # Insert enough data to trigger compactions that eliminate t2 and t3
 let $max = 50000;
 let $table = t1;
---source drop_table_repopulate_table.inc
+--source suite/rocksdb/include/drop_table_repopulate_table.inc
 let $table = t4;
---source drop_table_repopulate_table.inc
+--source suite/rocksdb/include/drop_table_repopulate_table.inc
 
 
 # Restart the server before t4's indices are deleted
@@ -81,11 +75,15 @@ CREATE TABLE t5 (
   b int not null,
   primary key (a,b) comment 'cf1',
   key (b) comment 'rev:cf2'
-) ENGINE=RocksDB;
+) ENGINE=ROCKSDB;
 
 let $max = 1000;
 let $table = t5;
---source drop_table_repopulate_table.inc
+--source suite/rocksdb/include/drop_table_repopulate_table.inc
+
+set @@global.rocksdb_compact_cf = 'cf1';
+set @@global.rocksdb_compact_cf = 'rev:cf2';
+set @@global.rocksdb_compact_cf = 'default';
 
 let $output= $MYSQLTEST_VARDIR/tmp/size_output;
 
@@ -95,6 +93,10 @@ drop table t2;
 drop table t3;
 drop table t4;
 drop table t5;
+
+set @@global.rocksdb_compact_cf = 'cf1';
+set @@global.rocksdb_compact_cf = 'rev:cf2';
+set @@global.rocksdb_compact_cf = 'default';
 
 let $show_rpl_debug_info= 1; # to force post-failure printout
 let $wait_timeout= 300; # Override default 30 seconds with 300.
@@ -108,3 +110,4 @@ let $wait_condition = select count(*) = 0
 --exec perl suite/rocksdb/t/drop_table2_check.pl $output
 
 # Cleanup
+--remove_file $MYSQLTEST_VARDIR/tmp/size_output

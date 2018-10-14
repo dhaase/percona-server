@@ -485,7 +485,7 @@ log_online_make_bitmap_name(
 /*=========================*/
 	lsn_t	start_lsn)	/*!< in: the start LSN name part */
 {
-	ut_snprintf(log_bmp_sys->out.name, FN_REFLEN, bmp_file_name_template,
+	ut_snprintf(log_bmp_sys->out.name, sizeof(log_bmp_sys->out.name), bmp_file_name_template,
 		    log_bmp_sys->bmp_file_home, bmp_file_name_stem,
 		    log_bmp_sys->out_seq_num, start_lsn);
 }
@@ -561,9 +561,9 @@ log_online_rotate_bitmap_file(
 	lsn_t	next_file_start_lsn)	/*!<in: the start LSN name
 					part */
 {
-	if (log_bmp_sys->out.file != os_file_invalid) {
+	if (!log_bmp_sys->out.file.is_closed()) {
 		os_file_close(log_bmp_sys->out.file);
-		log_bmp_sys->out.file = os_file_invalid;
+		log_bmp_sys->out.file.set_closed();
 	}
 	log_bmp_sys->out_seq_num++;
 	log_online_make_bitmap_name(next_file_start_lsn);
@@ -789,9 +789,9 @@ log_online_read_shutdown(void)
 
 	ib_rbt_node_t *free_list_node = log_bmp_sys->page_free_list;
 
-	if (log_bmp_sys->out.file != os_file_invalid) {
+	if (!log_bmp_sys->out.file.is_closed()) {
 		os_file_close(log_bmp_sys->out.file);
-		log_bmp_sys->out.file = os_file_invalid;
+		log_bmp_sys->out.file.set_closed();
 	}
 
 	rbt_free(log_bmp_sys->modified_pages);
@@ -1181,10 +1181,8 @@ log_online_write_bitmap_page(
 		return false;
 	}
 
-#ifdef UNIV_LINUX
-	posix_fadvise(log_bmp_sys->out.file, log_bmp_sys->out.offset,
-		      MODIFIED_PAGE_BLOCK_SIZE, POSIX_FADV_DONTNEED);
-#endif
+	os_file_advise(log_bmp_sys->out.file, log_bmp_sys->out.offset,
+		       MODIFIED_PAGE_BLOCK_SIZE, OS_FILE_ADVISE_DONTNEED);
 
 	log_bmp_sys->out.offset += MODIFIED_PAGE_BLOCK_SIZE;
 	return true;
@@ -1549,10 +1547,10 @@ log_online_open_bitmap_file_read_only(
 	if (srv_data_home_len
 			&& srv_data_home[srv_data_home_len-1]
 			!= SRV_PATH_SEPARATOR) {
-		ut_snprintf(bitmap_file->name, FN_REFLEN, "%s%c%s",
+		ut_snprintf(bitmap_file->name, sizeof(bitmap_file->name), "%s%c%s",
 				srv_data_home, SRV_PATH_SEPARATOR, name);
 	} else {
-		ut_snprintf(bitmap_file->name, FN_REFLEN, "%s%s",
+		ut_snprintf(bitmap_file->name, sizeof(bitmap_file->name), "%s%s",
 				srv_data_home, name);
 	}
 	bitmap_file->file
@@ -1574,10 +1572,8 @@ log_online_open_bitmap_file_read_only(
 	bitmap_file->size = os_file_get_size(bitmap_file->file);
 	bitmap_file->offset = 0;
 
-#ifdef UNIV_LINUX
-	posix_fadvise(bitmap_file->file, 0, 0, POSIX_FADV_SEQUENTIAL);
-	posix_fadvise(bitmap_file->file, 0, 0, POSIX_FADV_NOREUSE);
-#endif
+	os_file_advise(bitmap_file->file, 0, 0, OS_FILE_ADVISE_SEQUENTIAL);
+	os_file_advise(bitmap_file->file, 0, 0, OS_FILE_ADVISE_NOREUSE);
 
 	return true;
 }
@@ -1660,7 +1656,7 @@ log_online_bitmap_iterator_init(
 		/* Empty range */
 		i->in_files.count = 0;
 		i->in_files.files = NULL;
-		i->in.file = os_file_invalid;
+		i->in.file.set_closed();
 		i->page = NULL;
 		i->failed = false;
 		return true;
@@ -1678,7 +1674,7 @@ log_online_bitmap_iterator_init(
 	if (i->in_files.count == 0) {
 
 		/* Empty range */
-		i->in.file = os_file_invalid;
+		i->in.file.set_closed();
 		i->page = NULL;
 		i->failed = false;
 		return true;
@@ -1719,10 +1715,10 @@ log_online_bitmap_iterator_release(
 {
 	ut_a(i);
 
-	if (i->in.file != os_file_invalid) {
+	if (!i->in.file.is_closed()) {
 
 		os_file_close(i->in.file);
-		i->in.file = os_file_invalid;
+		i->in.file.set_closed();
 	}
 	if (i->in_files.files) {
 
@@ -1777,7 +1773,7 @@ log_online_bitmap_iterator_next(
 			/* Advance file */
 			i->in_i++;
 			success = os_file_close_no_error_handling(i->in.file);
-			i->in.file = os_file_invalid;
+			i->in.file.set_closed();
 			if (UNIV_UNLIKELY(!success)) {
 
 				os_file_get_last_error(true);
@@ -1886,10 +1882,12 @@ log_online_purge_changed_page_bitmaps(
 		/* If we have to delete the current output file, close it
 		first. */
 		os_file_close(log_bmp_sys->out.file);
-		log_bmp_sys->out.file = os_file_invalid;
+		log_bmp_sys->out.file.set_closed();
 	}
 
 	for (i = 0; i < bitmap_files.count; i++) {
+
+		char	full_bmp_file_name[2 * FN_REFLEN + 2];
 
 		/* We consider the end LSN of the current bitmap, derived from
 		the start LSN of the subsequent bitmap file, to determine
@@ -1906,8 +1904,45 @@ log_online_purge_changed_page_bitmaps(
 
 			break;
 		}
+
+		/* In some non-trivial cases the sequence of .xdb files may
+		have gaps. For instance:
+			ib_modified_log_1_0.xdb
+			ib_modified_log_2_<mmm>.xdb
+			ib_modified_log_4_<nnn>.xdb
+		Adding this check as a safety precaution. */
+		if (bitmap_files.files[i].name[0] == '\0')
+			continue;
+
+		/* If redo log tracking is enabled, reuse 'bmp_file_home'
+		from 'log_bmp_sys'. Otherwise, compose the full '.xdb' file
+		path from 'srv_data_home', adding a path separator if
+		necessary. */
+		if (log_bmp_sys != NULL) {
+			ut_snprintf(full_bmp_file_name,
+				sizeof(full_bmp_file_name),
+				"%s%s", log_bmp_sys->bmp_file_home,
+				bitmap_files.files[i].name);
+		}
+		else {
+			char		separator[2] = {0, 0};
+			const size_t	srv_data_home_len =
+				strlen(srv_data_home);
+
+			ut_a(srv_data_home_len < FN_REFLEN);
+			if (srv_data_home_len != 0 &&
+				srv_data_home[srv_data_home_len - 1] !=
+				SRV_PATH_SEPARATOR) {
+				separator[0] = SRV_PATH_SEPARATOR;
+			}
+			ut_snprintf(full_bmp_file_name,
+				sizeof(full_bmp_file_name), "%s%s%s",
+				srv_data_home, separator,
+				bitmap_files.files[i].name);
+		}
+
 		if (!os_file_delete_if_exists(innodb_bmp_file_key,
-					      bitmap_files.files[i].name,
+					      full_bmp_file_name,
 					      NULL)) {
 
 			os_file_get_last_error(true);

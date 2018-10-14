@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -1334,7 +1334,7 @@ buf_LRU_check_size_of_non_data_objects(
 
 			buf_lru_switched_on_innodb_mon = true;
 			srv_print_innodb_monitor = TRUE;
-			os_event_set(lock_sys->timeout_event);
+			os_event_set(srv_monitor_event);
 		}
 
 	} else if (buf_lru_switched_on_innodb_mon) {
@@ -1400,7 +1400,7 @@ buf_LRU_handle_lack_of_free_blocks(ulint n_iterations, ulint started_ms,
 		*mon_value_was = srv_print_innodb_monitor;
 		*started_monitor = true;
 		srv_print_innodb_monitor = true;
-		os_event_set(lock_sys->timeout_event);
+		os_event_set(srv_monitor_event);
 	}
 
 }
@@ -2152,7 +2152,7 @@ not_freed:
 	}
 
 	if (b) {
-		memcpy(b, bpage, sizeof *b);
+		new (b) buf_page_t(*bpage);
 	}
 
 	if (!buf_LRU_block_remove_hashed(bpage, zip)) {

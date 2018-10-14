@@ -1,4 +1,4 @@
-/* Copyright (c) 2006, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -34,13 +34,12 @@ partition_info *partition_info::get_clone(bool reset /* = false */)
   DBUG_ENTER("partition_info::get_clone");
   List_iterator<partition_element> part_it(partitions);
   partition_element *part;
-  partition_info *clone= new partition_info();
+  partition_info *clone= new partition_info(*this);
   if (!clone)
   {
     mem_alloc_error(sizeof(partition_info));
     DBUG_RETURN(NULL);
   }
-  memcpy(clone, this, sizeof(partition_info));
   memset(&(clone->read_partitions), 0, sizeof(clone->read_partitions));
   memset(&(clone->lock_partitions), 0, sizeof(clone->lock_partitions));
   clone->bitmaps_are_initialized= FALSE;
@@ -51,13 +50,12 @@ partition_info *partition_info::get_clone(bool reset /* = false */)
   {
     List_iterator<partition_element> subpart_it(part->subpartitions);
     partition_element *subpart;
-    partition_element *part_clone= new partition_element();
+    partition_element *part_clone= new partition_element(*part);
     if (!part_clone)
     {
       mem_alloc_error(sizeof(partition_element));
       DBUG_RETURN(NULL);
     }
-    memcpy(part_clone, part, sizeof(partition_element));
 
     /*
       Mark that RANGE and LIST values needs to be fixed so that we don't
@@ -81,13 +79,12 @@ partition_info *partition_info::get_clone(bool reset /* = false */)
     part_clone->subpartitions.empty();
     while ((subpart= (subpart_it++)))
     {
-      partition_element *subpart_clone= new partition_element();
+      partition_element *subpart_clone= new partition_element(*subpart);
       if (!subpart_clone)
       {
         mem_alloc_error(sizeof(partition_element));
         DBUG_RETURN(NULL);
       }
-      memcpy(subpart_clone, subpart, sizeof(partition_element));
       part_clone->subpartitions.push_back(subpart_clone);
     }
     clone->partitions.push_back(part_clone);
@@ -1921,7 +1918,6 @@ void partition_info::print_no_partition_found(TABLE *table_arg)
   char *buf_ptr= (char*)&buf;
   TABLE_LIST table_list;
 
-  memset(&table_list, 0, sizeof(table_list));
   table_list.db= table_arg->s->db.str;
   table_list.table_name= table_arg->s->table_name.str;
 
@@ -3298,6 +3294,70 @@ bool fill_partition_tablespace_names(
   }
 
   return false;
+}
+
+/**
+  Fill output buffer with the name of the first partition / subpartition
+  found in the specified partition_info.
+
+  @param[in]  part_info       - Partition info.
+  @param[in]  normalized_path - Normalized path name of table and database
+  @param[out] first_name      - The name of the first partition.
+                                Must be at least FN_REFLEN bytes long.
+
+  @return true - On failure.
+  @return false - On success.
+*/
+bool fill_first_partition_name(
+       const partition_info *part_info,
+       const char *normalized_path,
+       char* first_name)
+{
+  // Do nothing if table is not partitioned.
+  if (!part_info)
+    return false;
+
+  if (part_info->is_sub_partitioned())
+  {
+    // Traverse through all partitions.
+    List_iterator<partition_element> part_it(
+      const_cast<partition_info *>(part_info)->partitions);
+    partition_element *part_elem;
+    while ((part_elem= part_it++))
+    {
+      // Traverse through all subpartitions.
+      List_iterator<partition_element> sub_it(part_elem->subpartitions);
+      partition_element *sub_elem;
+      while ((sub_elem= sub_it++))
+      {
+        if(sub_elem->partition_name != NULL)
+        {
+          create_subpartition_name(first_name, normalized_path,
+            part_elem->partition_name, sub_elem->partition_name,
+            NORMAL_PART_NAME);
+          return false;
+        }
+      }
+    }
+  }
+  else
+  {
+    // Traverse through all partitions.
+    List_iterator<partition_element> part_it(
+      const_cast<partition_info *>(part_info)->partitions);
+    partition_element *part_elem;
+    while ((part_elem= part_it++))
+    {
+      if(part_elem->partition_name != NULL)
+      {
+        create_partition_name(first_name, normalized_path,
+          part_elem->partition_name, NORMAL_PART_NAME, FALSE);
+        return false;
+      }
+    }
+  }
+
+  return true;
 }
 
 /**

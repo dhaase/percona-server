@@ -1,6 +1,6 @@
 #ifndef SYS_VARS_H_INCLUDED
 #define SYS_VARS_H_INCLUDED
-/* Copyright (c) 2002, 2015, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2002, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -25,6 +25,7 @@
 
 #include "my_global.h"
 #include "keycaches.h"            // dflt_key_cache
+#include "debug_sync.h"           // DEBUG_SYNC
 #include "my_bit.h"               // my_count_bits
 #include "my_getopt.h"            // get_opt_arg_type
 #include "mysql/plugin.h"         // enum_mysql_show_type
@@ -839,13 +840,18 @@ public:
 
 class Sys_var_version : public Sys_var_charptr
 {
+private:
+  char withsuffix[SERVER_VERSION_LENGTH];
+  char *withsuffix_ptr;
 public:
   Sys_var_version(const char *name_arg,
           const char *comment, int flag_args, ptrdiff_t off, size_t size,
           CMD_LINE getopt,
           enum charset_enum is_os_charset_arg,
           const char *def_val)
-    : Sys_var_charptr(name_arg, comment, flag_args, off, size, getopt, is_os_charset_arg, def_val)
+    : Sys_var_charptr(name_arg, comment, flag_args, off, size, getopt,
+          is_os_charset_arg, def_val),
+      withsuffix_ptr(withsuffix)
   {}
 
   ~Sys_var_version()
@@ -853,16 +859,32 @@ public:
 
   virtual uchar *global_value_ptr(THD *thd, LEX_STRING *base)
   {
-    uchar *value= Sys_var_charptr::global_value_ptr(thd, base);
+    char **version_ptr= reinterpret_cast<char**> (
+                               Sys_var_charptr::global_value_ptr(thd, base));
+    if (version_ptr == NULL || *version_ptr == NULL)
+      return NULL;
 
-    DBUG_EXECUTE_IF("alter_server_version_str",
-                    {
-                      static const char *altered_value= "some-other-version";
-                      uchar *altered_value_ptr= reinterpret_cast<uchar*> (& altered_value);
-                      value= altered_value_ptr;
-                    });
+    sys_var *suffix_var= find_sys_var(thd, STRING_WITH_LEN("version_suffix"));
+    if (suffix_var == NULL)
+      return reinterpret_cast<uchar*> (version_ptr);
 
-    return value;
+    char** suffix_ptr= reinterpret_cast<char**> (suffix_var->value_ptr(thd,
+                                                          OPT_GLOBAL, NULL));
+    if (suffix_ptr == NULL || *suffix_ptr == NULL)
+      return reinterpret_cast<uchar*> (version_ptr);
+
+    size_t suffix_ptr_len= strlen(*suffix_ptr);
+    size_t version_ptr_len= strlen(*version_ptr);
+
+    /* prepare concatenated @@version variable */
+    if (suffix_ptr_len + version_ptr_len + 1 > SERVER_VERSION_LENGTH)
+      suffix_ptr_len = SERVER_VERSION_LENGTH - version_ptr_len - 1;
+
+    memcpy(withsuffix, *version_ptr, version_ptr_len);
+    memcpy(withsuffix + version_ptr_len, *suffix_ptr, suffix_ptr_len);
+    withsuffix[suffix_ptr_len + version_ptr_len] = 0;
+
+    return reinterpret_cast<uchar*> (&withsuffix_ptr);
   }
 };
 
@@ -2117,6 +2139,13 @@ public:
 };
 
 
+/**
+  Class representing the 'tx_isolation' system variable. This
+  variable can also be indirectly set using 'SET TRANSACTION ISOLATION
+  LEVEL'. This variable is deprecated and will be removed in a
+  future release. 'transaction_isolation' is used an alternative
+  instead.
+*/
 class Sys_var_tx_isolation: public Sys_var_enum
 {
 public:
@@ -2125,9 +2154,12 @@ public:
           CMD_LINE getopt,
           const char *values[], uint def_val, PolyLock *lock,
           enum binlog_status_enum binlog_status_arg,
-          on_check_function on_check_func)
+          on_check_function on_check_func,
+          on_update_function on_update_func=0,
+          const char *substitute=0)
     :Sys_var_enum(name_arg, comment, flag_args, off, size, getopt,
-                  values, def_val, lock, binlog_status_arg, on_check_func)
+                  values, def_val, lock, binlog_status_arg, on_check_func,
+                  on_update_func, substitute)
   {}
   virtual bool session_update(THD *thd, set_var *var);
 };
@@ -2135,7 +2167,9 @@ public:
 
 /**
   Class representing the tx_read_only system variable for setting
-  default transaction access mode.
+  default transaction access mode. This variable is deprecated
+  and will be removed in future release. 'transaction_read_only'
+  is used as an alternative instead.
 
   Note that there is a special syntax - SET TRANSACTION READ ONLY
   (or READ WRITE) that sets the access mode for the next transaction
@@ -2149,9 +2183,12 @@ public:
                        ptrdiff_t off, size_t size, CMD_LINE getopt,
                        my_bool def_val, PolyLock *lock,
                        enum binlog_status_enum binlog_status_arg,
-                       on_check_function on_check_func)
+                       on_check_function on_check_func,
+                       on_update_function on_update_func=0,
+                       const char *substitute=0)
     :Sys_var_mybool(name_arg, comment, flag_args, off, size, getopt,
-                    def_val, lock, binlog_status_arg, on_check_func)
+                    def_val, lock, binlog_status_arg, on_check_func,
+                    on_update_func, substitute)
   {}
   virtual bool session_update(THD *thd, set_var *var);
 };
@@ -2201,9 +2238,11 @@ public:
           const char *comment, int flag_args, ptrdiff_t off, size_t size,
           CMD_LINE getopt,
           const char *values[], uint def_val, PolyLock *lock,
-          enum binlog_status_enum binlog_status_arg)
+          enum binlog_status_enum binlog_status_arg,
+          on_check_function on_check_func=0
+          )
     :Sys_var_enum(name_arg, comment, flag_args, off, size, getopt,
-                  values, def_val, lock, binlog_status_arg, NULL)
+                  values, def_val, lock, binlog_status_arg, on_check_func, NULL)
   {}
   virtual bool global_update(THD *thd, set_var *var);
 };
@@ -2723,6 +2762,13 @@ public:
     DBUG_ENTER("Sys_var_gtid_mode::global_update");
     bool ret= true;
 
+     /*
+      SET GITD_MODE command should ignore 'read-only' and 'super_read_only'
+      options so that it can update 'mysql.gtid_executed' replication repository
+      table.
+     */
+    thd->set_skip_readonly_check();
+
     /*
       Hold lock_log so that:
       - other transactions are not flushed while gtid_mode is changed;
@@ -2745,6 +2791,7 @@ public:
       to take the other locks.
     */
     gtid_mode_lock->wrlock();
+    DEBUG_SYNC(thd, "gtid_mode_update_gtid_mode_lock_wrlock_taken_will_take_global_sid_lock");
     channel_map.wrlock();
     mysql_mutex_lock(mysql_bin_log.get_log_lock());
     global_sid_lock->wrlock();
@@ -2787,7 +2834,7 @@ public:
                             mi->get_channel(), mi->is_auto_position()));
         if (mi != NULL && mi->is_auto_position())
         {
-          char buf[512];
+          char buf[1024];
           sprintf(buf, "replication channel '%.192s' is configured "
                   "in AUTO_POSITION mode. Execute "
                   "CHANGE MASTER TO MASTER_AUTO_POSITION = 0 "

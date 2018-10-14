@@ -24,7 +24,7 @@
 #include <unordered_map>
 
 /* MySQL header files */
-#include "./my_sys.h"
+#include "my_sys.h"
 #include "mysql/plugin.h"
 
 /* RocksDB header files */
@@ -55,7 +55,7 @@ public:
   //         or other Status on failure.
   // If returned status is OK, TransactionDB will eventually call UnLock().
   virtual rocksdb::Status TryLockFor(int64_t timeout_time
-                                     __attribute__((__unused__))) override;
+                                     MY_ATTRIBUTE((__unused__))) override;
 
   // Unlock Mutex that was successfully locked by Lock() or TryLockUntil()
   virtual void UnLock() override;
@@ -75,7 +75,11 @@ class Rdb_cond_var : public rocksdb::TransactionDBCondVar {
   Rdb_cond_var &operator=(const Rdb_cond_var &) = delete;
 
 public:
+#ifdef HAVE_PSI_INTERFACE
+  explicit Rdb_cond_var(PSI_memory_key psi_key);
+#else
   Rdb_cond_var();
+#endif
   virtual ~Rdb_cond_var();
 
   /*
@@ -133,8 +137,15 @@ public:
 
   virtual std::shared_ptr<rocksdb::TransactionDBCondVar>
   AllocateCondVar() override {
-    return std::make_shared<Rdb_cond_var>();
+    return std::make_shared<Rdb_cond_var>(PSI_NOT_INSTRUMENTED);
   }
+
+#ifdef HAVE_PSI_INTERFACE
+  virtual std::shared_ptr<rocksdb::TransactionDBCondVar>
+  AllocateCondVar(PSI_memory_key psi_key) {
+    return std::make_shared<Rdb_cond_var>(psi_key);
+  }
+#endif
 
   virtual ~Rdb_mutex_factory() {}
 };

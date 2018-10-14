@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -86,7 +86,8 @@ Query_tables_list::binlog_stmt_unsafe_errcode[BINLOG_STMT_UNSAFE_COUNT] =
   ER_BINLOG_UNSAFE_UPDATE_IGNORE,
   ER_BINLOG_UNSAFE_INSERT_TWO_KEYS,
   ER_BINLOG_UNSAFE_AUTOINC_NOT_FIRST,
-  ER_BINLOG_UNSAFE_FULLTEXT_PLUGIN
+  ER_BINLOG_UNSAFE_FULLTEXT_PLUGIN,
+  ER_BINLOG_UNSAFE_XA
 };
 
 
@@ -536,7 +537,6 @@ void lex_end(LEX *lex)
 
   delete lex->sphead;
   lex->sphead= NULL;
-  lex->clear_values_map();
 
   DBUG_VOID_RETURN;
 }
@@ -1403,10 +1403,12 @@ static int lex_one_token(YYSTYPE *yylval, THD *thd)
     case MY_LEX_ESCAPE:
       if (lip->yyGet() == 'N')
       {					// Allow \N as shortcut for NULL
+        push_deprecated_warn(thd, "\\N", "NULL");
 	yylval->lex_str.str=(char*) "\\N";
 	yylval->lex_str.length=2;
 	return NULL_SYM;
       }
+      // Fall through.
     case MY_LEX_CHAR:			// Unknown or single char token
     case MY_LEX_SKIP:			// This should not happen
       if (c == '-' && lip->yyPeek() == '-' &&
@@ -1481,12 +1483,14 @@ static int lex_one_token(YYSTYPE *yylval, THD *thd)
 	state= MY_LEX_HEX_NUMBER;
 	break;
       }
+      // Fall through.
     case MY_LEX_IDENT_OR_BIN:
       if (lip->yyPeek() == '\'')
       {                                 // Found b'bin-number'
         state= MY_LEX_BIN_NUMBER;
         break;
       }
+      // Fall through.
     case MY_LEX_IDENT:
       const char *start;
       if (use_mb(cs))
@@ -1844,7 +1848,9 @@ static int lex_one_token(YYSTYPE *yylval, THD *thd)
 	state= MY_LEX_USER_VARIABLE_DELIMITER;
 	break;
       }
+      // fallthrough
       /* " used for strings */
+      // Fall through.
     case MY_LEX_STRING:			// Incomplete text string
       if (!(yylval->lex_str.str = get_text(lip, 1, 1)))
       {
@@ -2280,7 +2286,9 @@ st_select_lex::st_select_lex
   outer_join(0),
   opt_hints_qb(NULL),
   m_agg_func_used(false),
-  sj_candidates(NULL)
+  m_json_agg_func_used(false),
+  sj_candidates(NULL),
+  hidden_order_field_count(0)
 {
 }
 
@@ -2341,16 +2349,16 @@ void st_select_lex_unit::exclude_level()
         removed, we must also exclude the Name_resolution_context
         belonging to this level. Do this by looping through inner
         subqueries and changing their contexts' outer context pointers
-        to point to the outer context of the removed SELECT_LEX.
+        to point to the outer select's context.
       */
       for (SELECT_LEX *s= u->first_select(); s; s= s->next_select())
       {
         if (s->context.outer_context == &sl->context)
-          s->context.outer_context= sl->context.outer_context;
+          s->context.outer_context= &sl->outer_select()->context;
       }
       if (u->fake_select_lex &&
           u->fake_select_lex->context.outer_context == &sl->context)
-        u->fake_select_lex->context.outer_context= sl->context.outer_context;
+        u->fake_select_lex->context.outer_context= &sl->outer_select()->context;
       u->master= master;
       last= &(u->next);
     }

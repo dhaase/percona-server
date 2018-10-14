@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -392,7 +392,7 @@ TABLE_SHARE *alloc_table_share(TABLE_LIST *table_list, const char *key,
                        table_cache_instances * sizeof(*cache_element_array),
                        NULL))
   {
-    memset(share, 0, sizeof(*share));
+    new (share) TABLE_SHARE;
 
     share->set_table_cache_key(key_buff, key, key_length);
 
@@ -458,7 +458,7 @@ void init_tmp_table_share(THD *thd, TABLE_SHARE *share, const char *key,
   DBUG_ENTER("init_tmp_table_share");
   DBUG_PRINT("enter", ("table: '%s'.'%s'", key, table_name));
 
-  memset(share, 0, sizeof(*share));
+  new (share) TABLE_SHARE;
   init_sql_alloc(key_memory_table_share,
                  &share->mem_root, TABLE_ALLOC_BLOCK_SIZE, 0);
   share->table_category=         TABLE_CATEGORY_TEMPORARY;
@@ -929,18 +929,22 @@ void KEY_PART_INFO::init_from_field(Field *fld)
 /**
   Setup key-related fields of Field object for given key and key part.
 
-  @param[in]     share         Pointer to TABLE_SHARE
-  @param[in]     handler       Pointer to handler
-  @param[in]     primary_key_n Primary key number
-  @param[in]     keyinfo       Pointer to processed key
-  @param[in]     key_n         Processed key number
-  @param[in]     key_part_n    Processed key part number
-  @param[in,out] usable_parts  Pointer to usable_parts variable
+  @param[in]     share                    Pointer to TABLE_SHARE
+  @param[in]     handler_file             Pointer to handler
+  @param[in]     primary_key_n            Primary key number
+  @param[in]     keyinfo                  Pointer to processed key
+  @param[in]     key_n                    Processed key number
+  @param[in]     key_part_n               Processed key part number
+  @param[in,out] usable_parts             Pointer to usable_parts variable
+  @param[in]     part_of_key_not_extended Set when column is part of the Key
+                                          and not appended by the storage
+                                          engine from primary key columns.
 */
 
 static void setup_key_part_field(TABLE_SHARE *share, handler *handler_file,
                                  uint primary_key_n, KEY *keyinfo, uint key_n,
-                                 uint key_part_n, uint *usable_parts)
+                                 uint key_part_n, uint *usable_parts,
+                                 bool part_of_key_not_extended)
 {
   KEY_PART_INFO *key_part= &keyinfo->key_part[key_part_n];
   Field *field= key_part->field;
@@ -968,7 +972,8 @@ static void setup_key_part_field(TABLE_SHARE *share, handler *handler_file,
     {
       share->keys_for_keyread.set_bit(key_n);
       field->part_of_key.set_bit(key_n);
-      field->part_of_key_not_clustered.set_bit(key_n);
+      if (part_of_key_not_extended)
+        field->part_of_key_not_extended.set_bit(key_n);
     }
     if (handler_file->index_flags(key_n, key_part_n, 1) & HA_READ_ORDER)
       field->part_of_sortkey.set_bit(key_n);
@@ -1047,7 +1052,7 @@ static uint add_pk_parts_to_sk(KEY *sk, uint sk_n, KEY *pk, uint pk_n,
 
       *current_key_part= *pk_key_part;
       setup_key_part_field(share, handler_file, pk_n, sk, sk_n,
-                           sk->actual_key_parts, usable_parts);
+                           sk->actual_key_parts, usable_parts, false);
       sk->actual_key_parts++;
       sk->unused_key_parts--;
       sk->rec_per_key[sk->actual_key_parts - 1]= 0;
@@ -2415,7 +2420,7 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
 
   /* update zip dict info (name + data) from the handler */
   if (share->has_compressed_columns())
-    handler_file->update_field_defs_with_zip_dict_info(thd);
+    handler_file->update_field_defs_with_zip_dict_info(thd, NULL);
 
   /* Fix key->name and key_part->field */
   if (key_parts)
@@ -2423,6 +2428,16 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
     const int pk_off= find_type(primary_key_name, &share->keynames,
                                   FIND_TYPE_NO_PREFIX);
     uint primary_key= (pk_off > 0 ? pk_off-1 : MAX_KEY);
+    /*
+      The following if-else is here for MyRocks:
+      set share->primary_key as early as possible, because the return value
+      of ha_rocksdb::index_flags(key, ...) (HA_KEYREAD_ONLY bit in particular)
+      depends on whether the key is the primary key.
+    */
+    if (primary_key < MAX_KEY && share->keys_in_use.is_set(primary_key))
+      share->primary_key= primary_key;
+    else
+      share->primary_key= MAX_KEY;
 
     longlong ha_option= handler_file->ha_table_flags();
     keyinfo= share->key_info;
@@ -2487,6 +2502,13 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
 	    break;
 	  }
 	}
+
+        /*
+          The following is here for MyRocks. See the comment above
+          about "set share->primary_key as early as possible"
+        */
+        if (primary_key < MAX_KEY && share->keys_in_use.is_set(primary_key))
+          share->primary_key= primary_key;
       }
 
       for (i=0 ; i < keyinfo->user_defined_key_parts ; key_part++,i++)
@@ -2526,7 +2548,7 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
           keyinfo->flags|= HA_VIRTUAL_GEN_KEY;
 
         setup_key_part_field(share, handler_file, primary_key,
-                             keyinfo, key, i, &usable_parts);
+                             keyinfo, key, i, &usable_parts, true);
 
         field->flags|= PART_KEY_FLAG;
         if (key == primary_key)
@@ -2611,10 +2633,28 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
     if (handler_file->init_with_fields())
       goto err;
 
-    if (primary_key < MAX_KEY &&
-	(share->keys_in_use.is_set(primary_key)))
+    if (primary_key < MAX_KEY && (handler_file->ha_table_flags() &
+                                  HA_PRIMARY_KEY_IN_READ_INDEX))
     {
-      share->primary_key= primary_key;
+      keyinfo= &share->key_info[primary_key];
+      key_part= keyinfo->key_part;
+      for (i=0 ; i < keyinfo->user_defined_key_parts ; key_part++,i++)
+      {
+        Field *field= key_part->field;
+        /*
+          If this field is part of the primary key and all keys contains
+          the primary key, then we can use any key to find this column
+        */
+        if (field->key_length() == key_part->length &&
+            !(field->flags & BLOB_FLAG))
+          field->part_of_key= share->keys_in_use;
+        if (field->part_of_sortkey.is_set(primary_key))
+            field->part_of_sortkey= share->keys_in_use;
+      }
+    }
+
+    if (share->primary_key != MAX_KEY)
+    {
       /*
 	If we are using an integer as the primary key then allow the user to
 	refer to it as '_rowid'
@@ -2630,8 +2670,6 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
         }
       }
     }
-    else
-      share->primary_key = MAX_KEY; // we do not have a primary key
   }
   else
     share->primary_key= MAX_KEY;
@@ -2840,9 +2878,21 @@ static bool fix_fields_gcol_func(THD *thd, Field *field)
   save_use_only_table_context= thd->lex->use_only_table_context;
   thd->lex->use_only_table_context= TRUE;
 
-  /* Fix fields referenced to by the generated column function */
+  bool charset_switched= false;
+  const CHARSET_INFO *saved_collation_connection= func_expr->default_charset();
+  if (saved_collation_connection != table->s->table_charset)
+  {
+   thd->variables.collation_connection= table->s->table_charset;
+   charset_switched= true;
+  }
+
   Item *new_func= func_expr;
   error= func_expr->fix_fields(thd, &new_func);
+
+  /* Restore the current connection character set and collation. */
+  if (charset_switched)
+    thd->variables.collation_connection=  saved_collation_connection;
+
   /* Restore the original context*/
   thd->lex->use_only_table_context= save_use_only_table_context;
   context->table_list= save_table_list;
@@ -3118,7 +3168,7 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
                       share->table_name.str, (long) outparam));
 
   error= 1;
-  memset(outparam, 0, sizeof(*outparam));
+  new (outparam) TABLE;
   outparam->in_use= thd;
   outparam->s= share;
   outparam->db_stat= db_stat;
@@ -3575,7 +3625,7 @@ void free_blobs(TABLE *table)
 
 /**
   Reclaims temporary blob storage which is bigger than a threshold.
-  Resets blob pointer.
+  Resets blob pointer. Unsets m_keep_old_value.
 
   @param table A handle to the TABLE object containing blob fields
   @param size The threshold value.
@@ -3592,6 +3642,9 @@ void free_blob_buffers_and_reset(TABLE *table, uint32 size)
     if (blob->get_field_buffer_size() > size)
       blob->mem_free();
     blob->reset();
+
+    if (blob->is_virtual_gcol())
+      blob->set_keep_old_value(false);
   }
 }
 
@@ -4352,11 +4405,7 @@ bool check_column_name(const char *name)
                                and type)
 
   @retval  FALSE  OK
-  @retval  TRUE   There was an error. An error message is output
-                  to the error log.  We do not push an error
-                  message into the error stack because this
-                  function is currently only called at start up,
-                  and such errors never reach the user.
+  @retval  TRUE   There was an error.
 */
 
 bool
@@ -4371,7 +4420,7 @@ Table_check_intact::check(TABLE *table, const TABLE_FIELD_DEF *table_def)
 
   /* Whether the table definition has already been validated. */
   if (table->s->table_field_def_cache == table_def)
-    DBUG_RETURN(FALSE);
+    goto end;
 
   if (table->s->fields != table_def->count)
   {
@@ -4447,28 +4496,28 @@ Table_check_intact::check(TABLE *table, const TABLE_FIELD_DEF *table_def)
       if (strncmp(sql_type.c_ptr_safe(), field_def->type.str,
                   field_def->type.length - 1))
       {
-        report_error(0, "Incorrect definition of table %s.%s: "
-                     "expected column '%s' at position %d to have type "
-                     "%s, found type %s.", table->s->db.str, table->alias,
-                     field_def->name.str, i, field_def->type.str,
+        report_error(ER_CANNOT_LOAD_FROM_TABLE_V2, "Incorrect definition of "
+                     "table %s.%s: expected column '%s' at position %d to "
+                     "have type %s, found type %s.", table->s->db.str,
+                     table->alias, field_def->name.str, i, field_def->type.str,
                      sql_type.c_ptr_safe());
         error= TRUE;
       }
       else if (field_def->cset.str && !field->has_charset())
       {
-        report_error(0, "Incorrect definition of table %s.%s: "
-                     "expected the type of column '%s' at position %d "
-                     "to have character set '%s' but the type has no "
-                     "character set.", table->s->db.str, table->alias,
+        report_error(ER_CANNOT_LOAD_FROM_TABLE_V2, "Incorrect definition of "
+                     "table %s.%s: expected the type of column '%s' at "
+                     "position %d to have character set '%s' but the type "
+                     "has no character set.", table->s->db.str, table->alias,
                      field_def->name.str, i, field_def->cset.str);
         error= TRUE;
       }
       else if (field_def->cset.str &&
                strcmp(field->charset()->csname, field_def->cset.str))
       {
-        report_error(0, "Incorrect definition of table %s.%s: "
-                     "expected the type of column '%s' at position %d "
-                     "to have character set '%s' but found "
+        report_error(ER_CANNOT_LOAD_FROM_TABLE_V2, "Incorrect definition of "
+                     "table %s.%s: expected the type of column '%s' at "
+                     "position %d to have character set '%s' but found "
                      "character set '%s'.", table->s->db.str, table->alias,
                      field_def->name.str, i, field_def->cset.str,
                      field->charset()->csname);
@@ -4477,9 +4526,9 @@ Table_check_intact::check(TABLE *table, const TABLE_FIELD_DEF *table_def)
     }
     else
     {
-      report_error(0, "Incorrect definition of table %s.%s: "
-                   "expected column '%s' at position %d to have type %s "
-                   " but the column is not found.",
+      report_error(ER_CANNOT_LOAD_FROM_TABLE_V2, "Incorrect definition of "
+                   "table %s.%s: expected column '%s' at position %d to "
+                   "have type %s but the column is not found.",
                    table->s->db.str, table->alias,
                    field_def->name.str, i, field_def->type.str);
       error= TRUE;
@@ -4488,6 +4537,15 @@ Table_check_intact::check(TABLE *table, const TABLE_FIELD_DEF *table_def)
 
   if (! error)
     table->s->table_field_def_cache= table_def;
+
+end:
+
+  if (has_keys && !error && !table->key_info)
+  {
+    my_error(ER_MISSING_KEY, MYF(0), table->s->db.str,
+             table->s->table_name.str);
+    error= TRUE;
+  }
 
   DBUG_RETURN(error);
 }
@@ -4759,8 +4817,24 @@ void TABLE::init(THD *thd, TABLE_LIST *tl)
   /* Tables may be reused in a sub statement. */
   DBUG_ASSERT(!file->extra(HA_EXTRA_IS_ATTACHED_CHILDREN));
   
-  bool error MY_ATTRIBUTE((unused))= refix_gc_items(thd);
-  DBUG_ASSERT(!error);
+  /*
+    Do not call refix_gc_items() for tables which are not directly used by the
+    statement (i.e. used by the substatements of routines or triggers to be
+    invoked by the statement).
+
+    Firstly, there will be call to refix_gc_items() at the start of execution
+    of substatement which directly uses this table anyway.Secondly, cleanup of
+    generated column (call to cleanup_gc_items()) for the table will be done
+    only at the end of execution of substatement which uses it. Because of this
+    call to refix_gc_items() for prelocking placeholder will miss corresponding
+    call to cleanup_gc_items() if substatement which uses the table is not
+    executed for some reason.
+  */
+  if (!pos_in_table_list->prelocking_placeholder)
+  {
+    bool error MY_ATTRIBUTE((unused))= refix_gc_items(thd);
+    DBUG_ASSERT(!error);
+  }
 }
 
 
@@ -4927,14 +5001,16 @@ TABLE_LIST *TABLE_LIST::new_nested_join(MEM_ROOT *allocator,
   DBUG_ASSERT(belongs_to && select);
 
   TABLE_LIST *const join_nest=
-    (TABLE_LIST *) alloc_root(allocator, ALIGN_SIZE(sizeof(TABLE_LIST))+
-                                                    sizeof(NESTED_JOIN));
+    (TABLE_LIST*) alloc_root(allocator, sizeof(TABLE_LIST));
   if (join_nest == NULL)
     return NULL;
+  new (join_nest) TABLE_LIST;
 
-  memset(join_nest, 0, ALIGN_SIZE(sizeof(TABLE_LIST)) + sizeof(NESTED_JOIN));
   join_nest->nested_join=
-    (NESTED_JOIN *) ((uchar *)join_nest + ALIGN_SIZE(sizeof(TABLE_LIST)));
+    (NESTED_JOIN*) alloc_root(allocator, sizeof(NESTED_JOIN));
+  if (join_nest->nested_join == NULL)
+    return NULL;
+  new (join_nest->nested_join) NESTED_JOIN;
 
   join_nest->db= (char *)"";
   join_nest->db_length= 0;
@@ -7841,8 +7917,11 @@ bool update_generated_read_fields(uchar *buf, TABLE *table, uint active_index)
     if (!vfield->stored_in_db &&
         bitmap_is_set(table->read_set, vfield->field_index))
     {
-      if (vfield->type() == MYSQL_TYPE_BLOB)
-        (down_cast<Field_blob*>(vfield))->need_to_keep_old_value();
+      if ((vfield->flags & BLOB_FLAG) != 0)
+      {
+        (down_cast<Field_blob*>(vfield))->keep_old_value();
+        (down_cast<Field_blob*>(vfield))->set_keep_old_value(true);
+      }
 
       error= vfield->gcol_info->expr_item->save_in_field(vfield, 0);
       DBUG_PRINT("info", ("field '%s' - updated", vfield->field_name));
@@ -7912,12 +7991,15 @@ bool update_generated_write_fields(const MY_BITMAP *bitmap, TABLE *table)
     if (bitmap_is_set(bitmap, vfield->field_index))
     {
       /*
-        For a virtual generated column of blob type, we have to keep
+        For a virtual generated column based on the blob type, we have to keep
         the current blob value since this might be needed by the
         storage engine during updates.
       */
-      if (vfield->type() == MYSQL_TYPE_BLOB && vfield->is_virtual_gcol())
+      if ((vfield->flags & BLOB_FLAG) != 0 && vfield->is_virtual_gcol())
+      {
         (down_cast<Field_blob*>(vfield))->keep_old_value();
+        (down_cast<Field_blob*>(vfield))->set_keep_old_value(true);
+      }
 
       /* Generate the actual value of the generated fields */
       error= vfield->gcol_info->expr_item->save_in_field(vfield, 0);
@@ -7980,5 +8062,32 @@ void TABLE::mark_gcol_in_maps(Field *field)
       if (this->field[i]->is_virtual_gcol())
         bitmap_set_bit(write_set, i);
     }
+  }
+}
+
+bool TABLE::contains_records(THD *thd, bool *retval)
+{
+  READ_RECORD info_read_record;
+  *retval= true;
+  if (init_read_record(&info_read_record, thd, this, NULL, 1, 1, FALSE))
+    return true;
+
+  // read_record returns -1 for EOF.
+  *retval= (info_read_record.read_record(&info_read_record) != -1);
+  end_read_record(&info_read_record);
+
+  return false;
+}
+
+void TABLE::blobs_need_not_keep_old_value()
+{
+  for (Field **vfield_ptr= vfield; *vfield_ptr; vfield_ptr++)
+  {
+    Field *vfield= *vfield_ptr;
+    /*
+      Set this flag so that all blob columns can keep the old value.
+    */
+    if (vfield->type() == MYSQL_TYPE_BLOB && vfield->is_virtual_gcol())
+      (down_cast<Field_blob*>(vfield))->set_keep_old_value(false);
   }
 }

@@ -19,12 +19,17 @@
 #include <chrono>
 #include <string>
 #include <regex>
+#include <vector>
 
 /* MySQL header files */
-#include "./sql_string.h"
+#include "log.h"
+#include "my_stacktrace.h"
+#include "sql_regex.h"
+#include "sql_string.h"
 
 /* RocksDB header files */
 #include "rocksdb/slice.h"
+#include "rocksdb/status.h"
 
 #ifdef HAVE_JEMALLOC
 #include <jemalloc/jemalloc.h>
@@ -73,17 +78,13 @@ namespace myrocks {
 
   Use the power of SHIP_ASSERT() wisely.
 */
-#ifndef abort_with_stack_traces
-#define abort_with_stack_traces abort
-#endif
-
 #ifndef SHIP_ASSERT
-#define SHIP_ASSERT(expr)                                               \
-  do {                                                                  \
-    if (!(expr)) {                                                      \
-      my_safe_printf_stderr("\nShip assert failure: \'%s\'\n", #expr);  \
-      abort_with_stack_traces();                                        \
-    }                                                                   \
+#define SHIP_ASSERT(expr)                                                      \
+  do {                                                                         \
+    if (!(expr)) {                                                             \
+      my_safe_printf_stderr("\nShip assert failure: \'%s\'\n", #expr);         \
+      abort();                                                                 \
+    }                                                                          \
   } while (0)
 #endif  // SHIP_ASSERT
 
@@ -130,8 +131,18 @@ namespace myrocks {
   make sure that both failure and success paths are clearly identifiable. The
   definitions of FALSE and TRUE come from <my_global.h>.
 */
-#define HA_EXIT_SUCCESS FALSE
-#define HA_EXIT_FAILURE TRUE
+#define HA_EXIT_SUCCESS false
+#define HA_EXIT_FAILURE true
+
+/*
+  Macros to better convey the intent behind checking the results from locking
+  and unlocking mutexes.
+*/
+#define RDB_MUTEX_LOCK_CHECK(m)                                                \
+  rdb_check_mutex_call_result(__PRETTY_FUNCTION__, true, mysql_mutex_lock(&m))
+#define RDB_MUTEX_UNLOCK_CHECK(m)                                              \
+  rdb_check_mutex_call_result(__PRETTY_FUNCTION__, false,                      \
+                              mysql_mutex_unlock(&m))
 
 /*
   Generic constant.
@@ -208,99 +219,82 @@ inline int purge_all_jemalloc_arenas() {
 }
 
 /*
+  Helper function to check the result of locking or unlocking a mutex. We'll
+  intentionally abort in case of a failure because it's better to terminate
+  the process instead of continuing in an undefined state and corrupting data
+  as a result.
+*/
+inline void rdb_check_mutex_call_result(const char *function_name,
+                                        const bool attempt_lock,
+                                        const int result) {
+  if (unlikely(result)) {
+    /* NO_LINT_DEBUG */
+    sql_print_error("%s a mutex inside %s failed with an "
+                    "error code %d.",
+                    attempt_lock ? "Locking" : "Unlocking", function_name,
+                    result);
+
+    // This will hopefully result in a meaningful stack trace which we can use
+    // to efficiently debug the root cause.
+    abort();
+  }
+}
+
+void rdb_log_status_error(const rocksdb::Status &s, const char *msg = nullptr);
+
+// return true if the marker file exists which indicates that the corruption
+// has been detected
+bool rdb_check_rocksdb_corruption();
+
+// stores a marker file in the data directory so that after restart server
+// is still aware that rocksdb data is corrupted
+void rdb_persist_corruption_marker();
+
+/*
   Helper functions to parse strings.
 */
 
 const char *rdb_skip_spaces(const struct charset_info_st *const cs,
                             const char *str)
-    __attribute__((__nonnull__, __warn_unused_result__));
+    MY_ATTRIBUTE((__warn_unused_result__));
 
 bool rdb_compare_strings_ic(const char *const str1, const char *const str2)
-    __attribute__((__nonnull__, __warn_unused_result__));
+    MY_ATTRIBUTE((__warn_unused_result__));
 
 const char *rdb_find_in_string(const char *str, const char *pattern,
                                bool *const succeeded)
-    __attribute__((__nonnull__, __warn_unused_result__));
+    MY_ATTRIBUTE((__warn_unused_result__));
 
 const char *rdb_check_next_token(const struct charset_info_st *const cs,
                                  const char *str, const char *const pattern,
                                  bool *const succeeded)
-    __attribute__((__nonnull__, __warn_unused_result__));
+    MY_ATTRIBUTE((__warn_unused_result__));
 
 const char *rdb_parse_id(const struct charset_info_st *const cs,
                          const char *str, std::string *const id)
-    __attribute__((__nonnull__(1, 2), __warn_unused_result__));
+    MY_ATTRIBUTE((__warn_unused_result__));
 
 const char *rdb_skip_id(const struct charset_info_st *const cs, const char *str)
-    __attribute__((__nonnull__, __warn_unused_result__));
+    MY_ATTRIBUTE((__warn_unused_result__));
+
+const std::vector<std::string> parse_into_tokens(const std::string& s,
+                                                 const char delim);
 
 /*
   Helper functions to populate strings.
 */
 
 std::string rdb_hexdump(const char *data, const std::size_t data_len,
-                        const std::size_t maxsize = 0)
-    __attribute__((__nonnull__));
+                        const std::size_t maxsize = 0);
 
 /*
   Helper function to see if a database exists
  */
 bool rdb_database_exists(const std::string &db_name);
 
+void warn_about_bad_patterns(const Regex &regex, const char *name);
 
-/*
-  Helper class imported from webscale and needed by MyRocks.
-  Used to handle system options that are lists of regex expressions.
-*/
-class Regex_list_handler
-{
- private:
-#if defined(HAVE_PSI_INTERFACE)
-  const PSI_rwlock_key& m_key;
-#endif
-
-  char m_delimiter;
-  std::string m_bad_pattern_str;
-  std::unique_ptr<std::regex> m_pattern;
-
-  mutable mysql_rwlock_t m_rwlock;
-
-  Regex_list_handler(const Regex_list_handler& other)= delete;
-  Regex_list_handler& operator=(const Regex_list_handler& other)= delete;
-
- public:
-#if defined(HAVE_PSI_INTERFACE)
-  Regex_list_handler(const PSI_rwlock_key& key,
-                     char delimiter= ',') :
-    m_key(key),
-#else
-  Regex_list_handler(char delimiter= ',') :
-#endif
-    m_delimiter(delimiter),
-    m_bad_pattern_str("")
-  {
-    mysql_rwlock_init(key, &m_rwlock);
-  }
-
-  ~Regex_list_handler()
-  {
-    mysql_rwlock_destroy(&m_rwlock);
-  }
-
-  // Set the list of patterns
-  bool set_patterns(const std::string& patterns);
-
-  // See if a string matches at least one pattern
-  bool matches(const std::string& str) const;
-
-  // See the list of bad patterns
-  const std::string& bad_pattern() const
-  {
-    return m_bad_pattern_str;
-  }
-};
-
-void warn_about_bad_patterns(const Regex_list_handler* regex_list_handler,
-                             const char *name);
+std::vector<std::string> split_into_vector(const std::string& input,
+                                           char delimiter);
 
 }  // namespace myrocks

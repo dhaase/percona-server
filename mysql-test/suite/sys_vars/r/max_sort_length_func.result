@@ -144,6 +144,8 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxsy
 xxxxxxxxxxxxxxxxxxxxxxxxxxxxgw
 ** Results should not be sorted **
 RESET QUERY CACHE;
+Warnings:
+Warning	1681	'RESET QUERY CACHE' is deprecated and will be removed in a future release.
 '#--------------------FN_DYNVARS_098_04-------------------------#'
 SET max_sort_length=29;
 SELECT c from t ORDER BY c, id;
@@ -247,10 +249,10 @@ INSERT INTO t1 set c = concat(repeat('x',28),'g','w');
 SELECT c from t1 ORDER BY c, id;
 c
 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 xxxxxxxxxxxxxxxxxxxxxxxxxxxxrx
 xxxxxxxxxxxxxxxxxxxxxxxxxxxxsy
 xxxxxxxxxxxxxxxxxxxxxxxxxxxxgw
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 xxxxxxxxxxxxxxxxxxxxxxxxxxxxrx
 xxxxxxxxxxxxxxxxxxxxxxxxxxxxsy
 xxxxxxxxxxxxxxxxxxxxxxxxxxxxgw

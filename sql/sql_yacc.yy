@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2000, 2016 Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -463,6 +463,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, YYLTYPE **c, ulong *yystacksize);
    Comments for TOKENS.
    For each token, please include in the same line a comment that contains
    the following tags:
+   SQL-2015-R : Reserved keyword as per SQL-2015 draft
    SQL-2003-R : Reserved keyword as per SQL-2003
    SQL-2003-N : Non Reserved keyword as per SQL-2003
    SQL-1999-R : Reserved keyword as per SQL-1999
@@ -1145,6 +1146,12 @@ bool my_yyoverflow(short **a, YYSTYPE **b, YYLTYPE **c, ulong *yystacksize);
 %token  ZEROFILL
 
 /*
+   Tokens from MySQL 8.0
+*/
+%token  JSON_OBJECTAGG                /* SQL-2015-R */
+%token  JSON_ARRAYAGG                 /* SQL-2015-R */
+
+/*
   Resolve column attribute ambiguity -- force precedence of "UNIQUE KEY" against
   simple "UNIQUE" and "KEY" attributes:
 */
@@ -1195,7 +1202,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, YYLTYPE **c, ulong *yystacksize);
         text_string opt_gconcat_separator
 
 %type <num>
-        type type_with_opt_collate int_type real_type order_dir lock_option
+        type type_with_opt_collate int_type real_type lock_option
         udf_type if_exists opt_local opt_table_options table_options
         table_option opt_if_not_exists opt_no_write_to_binlog
         opt_temporary all_or_any opt_distinct
@@ -1205,6 +1212,7 @@ bool my_yyoverflow(short **a, YYSTYPE **b, YYLTYPE **c, ulong *yystacksize);
         opt_ev_status opt_ev_on_completion ev_on_completion opt_ev_comment
         ev_alter_on_schedule_completion opt_ev_rename_to opt_ev_sql_stmt
         trg_action_time trg_event field_def
+        ordering_direction opt_ordering_direction
 
 /*
   Bit field of MYSQL_START_TRANS_OPT_* flags.
@@ -1445,6 +1453,7 @@ END_OF_INPUT
 %type <subselect> subselect
 
 %type <order_expr> order_expr
+        grouping_expr
 
 %type <order_list> order_list group_list gorder_list opt_gorder_clause
 
@@ -2290,7 +2299,7 @@ create:
             lex->alter_info.reset();
             lex->col_list.empty();
             lex->change=NullS;
-            memset(&lex->create_info, 0, sizeof(lex->create_info));
+	    new (&lex->create_info) HA_CREATE_INFO;
             lex->create_info.options=$2 | $4;
             lex->create_info.default_table_charset= NULL;
             lex->name.str= 0;
@@ -4816,6 +4825,7 @@ tablespace_option:
         | ts_wait
         | opt_ts_comment
         | opt_ts_file_block_size
+        | opt_ts_encryption
         ;
 
 alter_tablespace_option_list:
@@ -5044,6 +5054,14 @@ opt_ts_file_block_size:
           }
         ;
 
+opt_ts_encryption:
+          ENCRYPTION_SYM opt_equal TEXT_STRING_sys
+          {
+            Lex->alter_tablespace_info->encrypt= true;
+            Lex->alter_tablespace_info->encrypt_type= $3;
+          }
+        ;
+
 ts_wait:
           WAIT_SYM
           {
@@ -5081,9 +5099,11 @@ size_number:
                 case 'g':
                 case 'G':
                   text_shift_number+=10;
+                  // Fall through.
                 case 'm':
                 case 'M':
                   text_shift_number+=10;
+                  // Fall through.
                 case 'k':
                 case 'K':
                   text_shift_number+=10;
@@ -6224,7 +6244,7 @@ storage_engines:
               $$= plugin_data<handlerton*>(plugin);
             else
             {
-              if (thd->variables.sql_mode & MODE_NO_ENGINE_SUBSTITUTION)
+              if (!is_engine_substitution_allowed(thd))
               {
                 my_error(ER_UNKNOWN_STORAGE_ENGINE, MYF(0), $1.str);
                 MYSQL_YYABORT;
@@ -6667,7 +6687,12 @@ type:
           {
             Lex->dec= const_cast<char *>($2);
             if (YYTHD->variables.sql_mode & MODE_MAXDB)
+            {
+              push_warning(current_thd, Sql_condition::SL_WARNING,
+                  WARN_DEPRECATED_MAXDB_SQL_MODE_FOR_TIMESTAMP,
+                  ER_THD(YYTHD, WARN_DEPRECATED_MAXDB_SQL_MODE_FOR_TIMESTAMP));
               $$=MYSQL_TYPE_DATETIME2;
+            }
             else
             {
               /*
@@ -7577,8 +7602,14 @@ btree_or_rtree:
         ;
 
 key_list:
-          key_list ',' key_part order_dir { Lex->col_list.push_back($3); }
-        | key_part order_dir { Lex->col_list.push_back($1); }
+          key_list ',' key_part opt_ordering_direction
+          {
+            Lex->col_list.push_back($3);
+          }
+        | key_part opt_ordering_direction
+          {
+            Lex->col_list.push_back($1);
+          }
         ;
 
 key_part:
@@ -7637,7 +7668,7 @@ alter:
             lex->select_lex->init_order();
             lex->select_lex->db=
                     const_cast<char*>((lex->select_lex->table_list.first)->db);
-            memset(&lex->create_info, 0, sizeof(lex->create_info));
+	    new (&lex->create_info) HA_CREATE_INFO;
             lex->create_info.db_type= 0;
             lex->create_info.default_table_charset= NULL;
             lex->create_info.row_type= ROW_TYPE_NOT_USED;
@@ -9300,6 +9331,7 @@ select_option:
           }
         | SQL_NO_CACHE_SYM
           {
+            push_deprecated_warn_no_replacement(YYTHD, "SQL_NO_CACHE");
             /*
               Allow this flag only on the first top-level SELECT statement, if
               SQL_CACHE wasn't specified, and only once per query.
@@ -9309,6 +9341,7 @@ select_option:
           }
         | SQL_CACHE_SYM
           {
+            push_deprecated_warn_no_replacement(YYTHD, "SQL_CACHE");
             /*
               Allow this flag only on the first top-level SELECT statement, if
               SQL_NO_CACHE wasn't specified, and only once per query.
@@ -10202,6 +10235,14 @@ sum_expr:
           {
             $$= NEW_PTN Item_sum_or(@$, $3);
           }
+        | JSON_ARRAYAGG '(' in_sum_expr ')'
+          {
+            $$= NEW_PTN Item_sum_json_array(@$, $3);
+          }
+        | JSON_OBJECTAGG '(' in_sum_expr ',' in_sum_expr ')'
+          {
+            $$= NEW_PTN Item_sum_json_object(@$, $3, $5);
+          }
         | BIT_XOR  '(' in_sum_expr ')'
           {
             $$= NEW_PTN Item_sum_xor(@$, $3);
@@ -10940,12 +10981,12 @@ opt_group_clause:
         ;
 
 group_list:
-          group_list ',' order_expr
+          group_list ',' grouping_expr
           {
             $1->push_back($3);
             $$= $1;
           }
-        | order_expr
+        | grouping_expr
           {
             $$= NEW_PTN PT_order_list();
             if ($1 == NULL)
@@ -10988,7 +11029,7 @@ alter_order_list:
         ;
 
 alter_order_item:
-          simple_ident_nospvar order_dir
+          simple_ident_nospvar opt_ordering_direction
           {
             ITEMIZE($1, &$1);
 
@@ -11034,9 +11075,13 @@ order_list:
           }
         ;
 
-order_dir:
+opt_ordering_direction:
           /* empty */ { $$ =  1; }
-        | ASC  { $$ =1; }
+        | ordering_direction
+        ;
+
+ordering_direction:
+          ASC  { $$ =1; }
         | DESC { $$ =0; }
         ;
 
@@ -11148,6 +11193,7 @@ opt_procedure_analyse_clause:
         | PROCEDURE_SYM ANALYSE_SYM
           '(' opt_procedure_analyse_params ')'
           {
+            push_deprecated_warn_no_replacement(YYTHD, "PROCEDURE ANALYSE");
             $$= NEW_PTN PT_procedure_analyse($4);
           }
         ;
@@ -11943,7 +11989,7 @@ show:
           SHOW
           {
             LEX *lex=Lex;
-            memset(&lex->create_info, 0, sizeof(lex->create_info));
+	    new (&lex->create_info) HA_CREATE_INFO;
           }
           show_param
         ;
@@ -12619,7 +12665,10 @@ flush_option:
         | RELAY LOGS_SYM opt_channel
           { Lex->type|= REFRESH_RELAY_LOG; }
         | QUERY_SYM CACHE_SYM
-          { Lex->type|= REFRESH_QUERY_CACHE_FREE; }
+          {
+            push_deprecated_warn_no_replacement(YYTHD, "FLUSH QUERY CACHE");
+            Lex->type|= REFRESH_QUERY_CACHE_FREE;
+          }
         | HOSTS_SYM
           { Lex->type|= REFRESH_HOSTS; }
         | PRIVILEGES
@@ -12672,7 +12721,11 @@ reset_option:
           SLAVE               { Lex->type|= REFRESH_SLAVE; }
           slave_reset_options opt_channel
         | MASTER_SYM          { Lex->type|= REFRESH_MASTER; }
-        | QUERY_SYM CACHE_SYM { Lex->type|= REFRESH_QUERY_CACHE;}
+        | QUERY_SYM CACHE_SYM
+          {
+            push_deprecated_warn_no_replacement(YYTHD, "RESET QUERY CACHE");
+            Lex->type|= REFRESH_QUERY_CACHE;
+          }
         | CHANGED_PAGE_BITMAPS_SYM
           { Lex->type |= REFRESH_RESET_PAGE_BITMAPS; }
         ;
@@ -13143,8 +13196,21 @@ table_wild:
         ;
 
 order_expr:
-          expr order_dir
+          expr opt_ordering_direction
           {
+            $$= NEW_PTN PT_order_expr($1, $2);
+          }
+        ;
+
+grouping_expr:
+          expr
+          {
+            $$= NEW_PTN PT_order_expr($1, 1);
+          }
+        | expr ordering_direction
+          {
+            push_deprecated_warn(YYTHD, "GROUP BY with ASC/DESC",
+                                 "GROUP BY ... ORDER BY ... ASC/DESC");
             $$= NEW_PTN PT_order_expr($1, $2);
           }
         ;
@@ -13172,6 +13238,8 @@ simple_ident_q:
           }
         | '.' ident '.' ident
           {
+            push_deprecated_warn(YYTHD, ".<table>.<column>",
+                                 "the table.column name without a dot prefix");
             $$= NEW_PTN PTI_simple_ident_q_3d(@$, NULL, $2.str, $4.str);
           }
         | ident '.' ident '.' ident
@@ -13208,7 +13276,11 @@ field_ident:
             }
             $$=$3;
           }
-        | '.' ident { $$=$2;} /* For Delphi */
+        | '.' ident /* For Delphi */
+          {
+            push_deprecated_warn(YYTHD, ".<column>", "the column name without a dot prefix");
+            $$=$2;
+          }
         ;
 
 table_ident:
@@ -13231,6 +13303,7 @@ table_ident:
         | '.' ident
           {
             /* For Delphi */
+            push_deprecated_warn(YYTHD, ".<table>", "the table name without a dot prefix");
             $$= NEW_PTN Table_ident(to_lex_cstring($2));
             if ($$ == NULL)
               MYSQL_YYABORT;
@@ -13905,7 +13978,7 @@ set:
           FOR_SYM statement 
           {
             $$= NEW_PTN PT_set(@1, @2,
-              NEW_PTN PT_start_set_stmt_option_value_list(
+              NEW_PTN PT_start_option_value_list_type(OPT_SESSION,
                 NEW_PTN PT_start_option_value_list_following_option_type_eq($3,
                                                                             @3,
                                                                             $4)), true);

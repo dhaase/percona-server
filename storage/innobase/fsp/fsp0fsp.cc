@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -231,7 +231,6 @@ fsp_flags_is_valid(
 	bool	has_data_dir = FSP_FLAGS_HAS_DATA_DIR(flags);
 	bool	is_shared = FSP_FLAGS_GET_SHARED(flags);
 	bool	is_temp = FSP_FLAGS_GET_TEMPORARY(flags);
-	bool	is_encryption = FSP_FLAGS_GET_ENCRYPTION(flags);
 
 	ulint	unused = FSP_FLAGS_GET_UNUSED(flags);
 
@@ -275,12 +274,6 @@ fsp_flags_is_valid(
 	It is not compatible with the TABLESPACE clause.  Nor is it
 	compatible with the TEMPORARY clause. */
 	if (has_data_dir && (is_shared || is_temp)) {
-		return(false);
-	}
-
-	/* Only single-table and not temp tablespaces use the encryption
-	clause. */
-	if (is_encryption && (is_shared || is_temp)) {
 		return(false);
 	}
 
@@ -598,7 +591,8 @@ xdes_get_descriptor_with_space_hdr(
 			  && fspace->id <= srv_undo_tablespaces))));
 	ut_ad(size == fspace->size_in_header);
 	ut_ad((flags & ~FSP_FLAGS_MASK_DATA_DIR)
-	      == (fspace->flags & ~FSP_FLAGS_MASK_DATA_DIR));
+	      == (fspace->flags & ~FSP_FLAGS_MASK_DATA_DIR)
+	      || fspace->purpose == FIL_TYPE_TEMPORARY);
 	if ((offset >= size) || (offset >= limit)) {
 		return(NULL);
 	}
@@ -936,6 +930,11 @@ fsp_header_fill_encryption_info(
 	if (version == Encryption::ENCRYPTION_VERSION_2) {
 		memcpy(ptr, Encryption::uuid, ENCRYPTION_SERVER_UUID_LEN);
 		ptr += ENCRYPTION_SERVER_UUID_LEN;
+		/* We should never write empty UUID. Only exemption is for
+		tablespaces when InnoDB is initializing (like system, temp, etc).
+		These tablespaces UUID will be fixed by handlerton API after server
+		generates uuid */
+		ut_ad(!innodb_inited || strlen(Encryption::uuid) != 0);
 	}
 
 	/* Write tablespace key to temp space. */
@@ -1010,6 +1009,9 @@ fsp_header_rotate_encryption(
 
 	const page_size_t	page_size(space->flags);
 
+	DBUG_EXECUTE_IF("fsp_header_rotate_encryption_failure",
+			return(false););
+
 	/* Fill encryption info. */
 	if (!fsp_header_fill_encryption_info(space,
 					     encrypt_info)) {
@@ -1047,6 +1049,52 @@ fsp_header_rotate_encryption(
 			  encrypt_info,
 			  ENCRYPTION_INFO_SIZE_V2,
 			  mtr);
+
+	return(true);
+}
+
+/** Enable encryption for already existing tablespace.
+@param[in,out]	space	tablespace object
+@return true if success, else false */
+bool
+fsp_enable_encryption(
+	fil_space_t*	space)
+{
+	byte		encrypt_info[ENCRYPTION_INFO_SIZE_V2];
+	ulint		space_id = space->id;
+
+	memset(encrypt_info, 0, ENCRYPTION_INFO_SIZE_V2);
+
+	if (!fsp_header_fill_encryption_info(space, encrypt_info)) {
+		return(false);
+	}
+
+	mtr_t		mtr;
+	mtr_start(&mtr);
+	mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
+	mtr.set_named_space(space_id);
+
+	space = mtr_x_lock_space(space_id, &mtr);
+
+	const page_size_t	page_size(space->flags);
+	buf_block_t* block = buf_page_get(page_id_t(space->id, 0), page_size,
+					  RW_SX_LATCH, &mtr);
+	buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
+	ut_ad(space->id == page_get_space_id(buf_block_get_frame(block)));
+
+	page_t* page = buf_block_get_frame(block);
+	mlog_write_ulint(FSP_HEADER_OFFSET + FSP_SPACE_FLAGS + page,
+			 space->flags, MLOG_4BYTES, &mtr);
+
+	ulint offset = fsp_header_get_encryption_offset(page_size);
+	ut_ad(offset != 0 && offset < UNIV_PAGE_SIZE);
+
+	mlog_write_string(page + offset,
+			  encrypt_info,
+			  ENCRYPTION_INFO_SIZE_V2,
+			  &mtr);
+
+	mtr_commit(&mtr);
 
 	return(true);
 }
@@ -1244,6 +1292,7 @@ fsp_header_decode_encryption_info(
 		memset(srv_uuid, 0, ENCRYPTION_SERVER_UUID_LEN + 1);
 		memcpy(srv_uuid, ptr, ENCRYPTION_SERVER_UUID_LEN);
 		ptr += ENCRYPTION_SERVER_UUID_LEN;
+		ut_ad(strlen(srv_uuid) != 0);
 	}
 
 	/* Get master key by key id. */
@@ -1284,8 +1333,9 @@ fsp_header_decode_encryption_info(
 	crc1 = mach_read_from_4(ptr);
 	crc2 = ut_crc32(key_info, ENCRYPTION_KEY_LEN * 2);
 	if (crc1 != crc2) {
-		ib::error() << "Failed to decrpt encryption information,"
-			<< " please check key file is not changed!";
+		ib::error() << "Failed to decrypt encryption information,"
+			<< " please confirm the master key was not changed.";
+		my_free(master_key);
 		return(false);
 	}
 
@@ -3227,7 +3277,7 @@ fseg_alloc_free_page_general(
 	fseg_inode_t*	inode;
 	ulint		space_id;
 	fil_space_t*	space;
-	buf_block_t*	iblock;
+	buf_block_t*	iblock = NULL;
 	buf_block_t*	block;
 	ulint		n_reserved;
 
@@ -3712,7 +3762,7 @@ fseg_free_page(
 	mtr_t*		mtr)	/*!< in/out: mini-transaction */
 {
 	fseg_inode_t*		seg_inode;
-	buf_block_t*		iblock;
+	buf_block_t*		iblock = NULL;
 	const fil_space_t*	space = mtr_x_lock_space(space_id, mtr);
 	const page_size_t	page_size(space->flags);
 
@@ -3963,7 +4013,7 @@ fseg_free_step_not_header(
 
 	const fil_space_t*	space = mtr_x_lock_space(space_id, mtr);
 	const page_size_t	page_size(space->flags);
-	buf_block_t*		iblock;
+	buf_block_t*		iblock = NULL;
 
 	inode = fseg_inode_get(header, space_id, page_size, mtr, &iblock);
 	SRV_CORRUPT_TABLE_CHECK(inode,

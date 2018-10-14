@@ -6,6 +6,18 @@
    :maxdepth: 1
    :glob:
 
+   Percona-Server-5.7.23-23
+   Percona-Server-5.7.22-22
+   Percona-Server-5.7.21-21
+   Percona-Server-5.7.21-20
+   Percona-Server-5.7.20-19
+   Percona-Server-5.7.20-18
+   Percona-Server-5.7.19-17
+   Percona-Server-5.7.18-16
+   Percona-Server-5.7.18-15
+   Percona-Server-5.7.18-14
+   Percona-Server-5.7.17-13
+   Percona-Server-5.7.17-12
    Percona-Server-5.7.17-11
    Percona-Server-5.7.16-10
    Percona-Server-5.7.15-9

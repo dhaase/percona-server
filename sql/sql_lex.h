@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -1297,9 +1297,11 @@ public:
     function.
   */
   bool agg_func_used()      const { return m_agg_func_used; }
+  bool json_agg_func_used() const { return m_json_agg_func_used; }
 
   void set_agg_func_used(bool val)      { m_agg_func_used= val; }
 
+  void set_json_agg_func_used(bool val) { m_json_agg_func_used= val; }
   /// Lookup for SELECT_LEX type
   type_enum type();
 
@@ -1354,6 +1356,7 @@ private:
   void delete_unused_merged_columns(List<TABLE_LIST> *tables);
 
   bool m_agg_func_used;
+  bool m_json_agg_func_used;
 
   /// Helper for fix_prepare_information()
   void fix_prepare_information_for_order(THD *thd,
@@ -1380,13 +1383,12 @@ private:
   bool change_group_ref(THD *thd, Item_func *expr, bool *changed);
   bool flatten_subqueries();
   bool setup_wild(THD *thd);
-  bool setup_order_final(THD *thd, int hidden_order_field_count);
+  bool setup_order_final(THD *thd);
   bool setup_group(THD *thd);
   void remove_redundant_subquery_clauses(THD *thd,
-                                         int hidden_group_field_count,
-                                         int hidden_order_field_count);
+                                         int hidden_group_field_count);
   void repoint_contexts_of_join_nests(List<TABLE_LIST> join_list);
-  void empty_order_list(int hidden_order_field_count);
+  void empty_order_list(SELECT_LEX *sl);
   /**
     Pointer to collection of subqueries candidate for semijoin
     conversion.
@@ -1394,6 +1396,9 @@ private:
   */
   Mem_root_array<Item_exists_subselect*, true> *sj_candidates;
 public:
+  /// How many expressions are part of the order by but not select list.
+  int hidden_order_field_count;
+
   bool fix_inner_refs(THD *thd);
   bool setup_conds(THD *thd);
   bool prepare(THD *thd);
@@ -2101,6 +2106,11 @@ public:
        Using a plugin is unsafe.
     */
     BINLOG_STMT_UNSAFE_FULLTEXT_PLUGIN,
+
+    /**
+      XA transactions and statements.
+    */
+    BINLOG_STMT_UNSAFE_XA,
 
     /* The last element of this enumeration type. */
     BINLOG_STMT_UNSAFE_COUNT
@@ -3137,7 +3147,7 @@ private:
     With Visual Studio, an std::map will always allocate two small objects
     on the heap. Sometimes we put LEX objects in a MEM_ROOT, and never run
     the LEX DTOR. To avoid memory leaks, put this std::map on the heap,
-    and call clear_values_map() in lex_end()
+    and call clear_values_map() at the end of each statement
    */
   std::map<Field *,Field *> *insert_update_values_map;
 public:

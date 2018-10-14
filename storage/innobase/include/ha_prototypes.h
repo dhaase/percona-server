@@ -293,6 +293,13 @@ thd_lock_wait_timeout(
 /*==================*/
 	THD*	thd);	/*!< in: thread handle, or NULL to query
 			the global innodb_lock_wait_timeout */
+
+/** Is FT ignore stopwords variable set.
+@param thd Thread object
+@return true if ft_ignore_stopwords is set, false otherwise. */
+bool
+thd_has_ft_ignore_stopwords(THD* thd) MY_ATTRIBUTE((warn_unused_result));
+
 /******************************************************************//**
 Add up the time waited for the lock for the current query. */
 void
@@ -565,9 +572,11 @@ innobase_get_trx(void);
 /** Get the transaction of the current connection handle if slow query log
 InnoDB extended statistics should be collected.
 @return transaction object if statistics should be collected, or NULL. */
+MY_NODISCARD
 trx_t*
 innobase_get_trx_for_slow_log(void);
 
+extern bool innodb_inited;
 #endif /* !UNIV_HOTBACKUP && !UNIV_INNOCHECKSUM */
 
 #endif /* HA_INNODB_PROTOTYPES_H */

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2016 Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2017 Oracle and/or its affiliates. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
@@ -104,7 +104,6 @@ private:
   void wait_for_clients_closure();
   void go_through_all_clients(ngs::function<void (Client_ptr)> callback);
   bool timeout_for_clients_validation();
-  void validate_client_state(chrono::time_point &oldest_object_time_of_life, const chrono::time_point& time_of_release, Client_ptr);
   void wait_for_next_client();
 
   // accept one connection, create a connection object for the client and tell it to
@@ -120,7 +119,7 @@ private:
   {
   public:
     Authentication_key(const std::string &key_name, const bool key_should_be_tls_active)
-    : name(key_name), should_be_tls_active(key_should_be_tls_active)
+    : name(key_name), must_be_secure_connection(key_should_be_tls_active)
     {
     }
 
@@ -133,11 +132,11 @@ private:
         return result < 0;
       }
 
-      return should_be_tls_active < key.should_be_tls_active;
+      return must_be_secure_connection < key.must_be_secure_connection;
     }
 
     const std::string name;
-    const bool should_be_tls_active;
+    const bool must_be_secure_connection;
   };
 
   typedef std::map<Authentication_key, Authentication_handler::create> Auth_handler_map;

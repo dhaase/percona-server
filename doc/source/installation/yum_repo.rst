@@ -10,7 +10,6 @@ The easiest way to install the *Percona Yum* repository is to install an *RPM* t
 
 Supported Releases:
 
-
  * *CentOS* 6 and *RHEL* 6 (Current Stable) [#f1]_
 
  * *CentOS* 7 and *RHEL* 7
@@ -52,13 +51,13 @@ Installing |Percona Server| from Percona ``yum`` repository
 
    .. code-block:: bash
 
-     yum install http://www.percona.com/downloads/percona-release/redhat/0.1-4/percona-release-0.1-4.noarch.rpm
+     yum install http://www.percona.com/downloads/percona-release/redhat/0.1-6/percona-release-0.1-6.noarch.rpm
 
    You should see some output such as the following: 
 
    .. code-block:: bash
 
-     Retrieving http://www.percona.com/downloads/percona-release/redhat/0.1-4/percona-release-0.1-4.noarch.rpm
+     Retrieving http://www.percona.com/downloads/percona-release/redhat/0.1-6/percona-release-0.1-6.noarch.rpm
      Preparing...                ########################################### [100%]
         1:percona-release        ########################################### [100%]
 

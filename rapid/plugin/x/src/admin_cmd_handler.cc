@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2016 Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2017, Oracle and/or its affiliates. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
@@ -16,11 +16,6 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
  * 02110-1301  USA
  */
-
-#if !defined(MYSQL_DYNAMIC_PLUGIN) && defined(WIN32) && !defined(XPLUGIN_UNIT_TESTS)
-// Needed for importing PERFORMANCE_SCHEMA plugin API.
-#define MYSQL_DYNAMIC_PLUGIN 1
-#endif // WIN32
 
 #include "admin_cmd_handler.h"
 #include "xpl_error.h"
@@ -1122,6 +1117,29 @@ ngs::Error_code is_schema_selected_and_exists(xpl::Sql_data_context &da, const s
   return da.execute_sql_no_result(qb.get().data(), qb.get().length(), info);
 }
 
+template<typename T>
+T get_system_variable(xpl::Sql_data_context &da, const std::string &variable)
+{
+  xpl::Sql_data_result result(da);
+  try
+  {
+    result.query(("SELECT @@" + variable).c_str());
+    if (result.size() != 1)
+    {
+      log_error("Unable to retrieve system variable '%s'", variable.c_str());
+      return T();
+    }
+    T value = T();
+    result.get(value);
+    return value;
+  }
+  catch (const ngs::Error_code &)
+  {
+    log_error("Unable to retrieve system variable '%s'", variable.c_str());
+    return T();
+  }
+}
+
 const char *const COUNT_DOC =
     "COUNT(CASE WHEN (column_name = 'doc' "
     "AND data_type = 'json') THEN 1 ELSE NULL END)";
@@ -1146,6 +1164,15 @@ ngs::Error_code xpl::Admin_command_handler::list_objects(Command_arguments &args
 {
   m_session.update_status<&Common_status_variables::m_stmt_list_objects>();
 
+  static const bool is_table_names_case_sensitive =
+      get_system_variable<long>(m_da, "lower_case_table_names") == 0l;
+
+  static const char *const BINARY_OPERATOR =
+      is_table_names_case_sensitive &&
+              get_system_variable<long>(m_da, "lower_case_file_system") == 0l
+          ? "BINARY "
+          : "";
+
   std::string schema, pattern;
   ngs::Error_code error = args
       .string_arg("schema", schema, true)
@@ -1153,23 +1180,32 @@ ngs::Error_code xpl::Admin_command_handler::list_objects(Command_arguments &args
   if (error)
     return error;
 
+  if (!is_table_names_case_sensitive) schema = to_lower(schema);
+
   error = is_schema_selected_and_exists(m_da, schema);
   if (error)
     return error;
 
   Query_string_builder qb;
-  qb.put("SELECT T.table_name AS name, "
-         "IF(ANY_VALUE(T.table_type) LIKE '%VIEW', "
-         "IF(COUNT(*)=1 AND ").put(COUNT_DOC).put("=1, 'COLLECTION_VIEW', 'VIEW'), "
-         "IF(COUNT(*)-2 = ")
+  qb.put("SELECT ")
+      .put(BINARY_OPERATOR)
+      .put("T.table_name AS name, "
+           "IF(ANY_VALUE(T.table_type) LIKE '%VIEW', "
+           "IF(COUNT(*)=1 AND ")
+      .put(COUNT_DOC)
+      .put("=1, 'COLLECTION_VIEW', 'VIEW'), IF(COUNT(*)-2 = ")
       .put(COUNT_GEN)
       .put(" AND ")
       .put(COUNT_DOC)
       .put("=1 AND ")
       .put(COUNT_ID)
       .put("=1, 'COLLECTION', 'TABLE')) AS type "
-           "FROM information_schema.tables AS T LEFT JOIN "
-           "information_schema.columns AS C USING (table_schema,table_name)"
+           "FROM information_schema.tables AS T "
+           "LEFT JOIN information_schema.columns AS C ON (")
+      .put(BINARY_OPERATOR)
+      .put("T.table_schema = C.table_schema AND ")
+      .put(BINARY_OPERATOR)
+      .put("T.table_name = C.table_name) "
            "WHERE T.table_schema = ");
   if (schema.empty())
     qb.put("schema()");
@@ -1177,7 +1213,7 @@ ngs::Error_code xpl::Admin_command_handler::list_objects(Command_arguments &args
     qb.quote_string(schema);
   if (!pattern.empty())
     qb.put(" AND T.table_name LIKE ").quote_string(pattern);
-  qb.put(" GROUP BY T.table_name ORDER BY T.table_name");
+  qb.put(" GROUP BY name ORDER BY name");
 
   Sql_data_context::Result_info info;
   error = m_da.execute_sql_and_stream_results(qb.get().data(),
